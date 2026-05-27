@@ -5,6 +5,7 @@ import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, Union
+import shutil
 
 import arviz as az
 import flax.linen as nn
@@ -33,6 +34,17 @@ from dl4bi.core.model_output import VAEOutput
 from dl4bi.core.train import TrainState, cosine_annealing_lr, evaluate, save_ckpt, train
 from dl4bi.vae import gMLPDeepRV
 from dl4bi.vae.train_utils import deep_rv_train_step, generate_surrogate_decoder
+
+DRIVE_RESULTS = "/content/drive/MyDrive/dl4bi_results"
+
+def sync_to_drive(src: Path):
+    """Copy a results directory to Drive."""
+    dst = Path(DRIVE_RESULTS) / src.relative_to("results")
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, dst / f.name)
+    print(f"Synced {src} → {dst}")
 
 
 def main(data_type, seed=59, num_chains=2, obs_ratio=0.5):
@@ -118,6 +130,7 @@ def main(data_type, seed=59, num_chains=2, obs_ratio=0.5):
         )
         with open(model_path / "single_res.pkl", "wb") as out_file:
             pickle.dump(res, out_file)
+        sync_to_drive(model_path)
         result.append(res)
     scatter_plot_model_vs_model(all_samples, list(models.keys()), obs_mask, save_dir)
     plot_models_predictive_means(
@@ -190,6 +203,7 @@ def hmc(
         pickle.dump(combined_samples, out_file)
     with open(results_dir / "hmc_pp.pkl", "wb") as out_file:
         pickle.dump(combined_post, out_file)
+    sync_to_drive(results_dir)
     return combined_samples, idata, combined_post, total_time
 
 
@@ -238,6 +252,7 @@ def surrogate_model_train(
     save_ckpt(state, DictConfig({}), results_dir / "model.ckpt")
     with open(results_dir / "train_metrics.pkl", "wb") as out_file:
         pickle.dump({"train_time": train_time, "eval_mse": eval_mse}, out_file)
+    sync_to_drive(results_dir)
     surrogate_decoder = generate_surrogate_decoder(state, model)
     return train_time, eval_mse, surrogate_decoder
 
