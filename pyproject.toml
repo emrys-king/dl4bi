@@ -5,18 +5,22 @@ description = "Deep Learning for Bayesian Inference (DL4BI)"
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 dependencies = [
+  "arviz>=0.23.4,<0.24.0",
   "dl4bi-sps>=0.1.2,<1",
   "einops>=0.8,<1",
   "flax>=0.12,<0.13",
+  "geopandas>=1.1.3,<2.0.0",
   "hydra-core>=1.3,<2",
   "jraph==0.0.6.dev0",
   "matplotlib>=3.10,<4",
   "numpy>=2.2,<3",
+  "numpyro>=0.21.0,<0.22.0",
   "optax>=0.2,<0.3",
   "orbax-checkpoint>=0.11,<1",
   "scikit-learn>=1.7,<2",
   "scipy>=1.15,<2",
   "scoringrules>=0.7,<1",
+  "seaborn>=0.13.2,<0.14.0",
   "tqdm>=4.67,<5",
   "wandb>=0.22,<1",
 ]
@@ -52,6 +56,7 @@ cuda13 = [
 
 [dependency-groups]
 dev = [
+  "dl4bi",
   "pre-commit>=4.0,<5",
   "pytest>=7.4,<8",
 ]
@@ -65,6 +70,14 @@ conflicts = [
     { extra = "cuda13" },
   ],
 ]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+dl4bi = { workspace = true, editable = true }
 
 [build-system]
 requires = ["hatchling"]
