@@ -130,6 +130,18 @@ def parse_args():
     p.add_argument("--ckpt_dir",     type=str,   default=None)
     p.add_argument("--no_exact_gp",  action="store_true",
                    help="Skip the exact GP NUTS baseline (faster development runs)")
+
+    # Training mode control
+    train_mode = p.add_mutually_exclusive_group()
+    train_mode.add_argument("--fresh_run", action="store_true",
+                   help="Delete existing checkpoints and train from scratch. "
+                        "Use when you want a clean run with new hyperparameters.")
+    train_mode.add_argument("--load_ckpt", type=str, default=None,
+                   metavar="CKPT_DIR",
+                   help="Load a trained network from this checkpoint directory "
+                        "and skip training entirely. Use when the surrogate is "
+                        "already trained and you only want to run inference. "
+                        "Example: --load_ckpt results/sim_checkpoints_grid16_q3")
     return p.parse_args()
 
 
@@ -730,6 +742,17 @@ def main():
         Path(args.results_dir) /
         f"sim_checkpoints_grid{args.grid_size}_q{args.q}"
     )
+
+    # Override ckpt_dir if loading from a specific checkpoint
+    if args.load_ckpt:
+        ckpt_dir = args.load_ckpt
+
+    # Delete checkpoints if fresh run requested
+    if args.fresh_run and Path(ckpt_dir).exists():
+        import shutil
+        log.info(f"--fresh_run: deleting existing checkpoints at {ckpt_dir}")
+        shutil.rmtree(ckpt_dir)
+        log.info("Checkpoints deleted — training from scratch.")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=== SM-DeepRV Simulation ===")
@@ -738,6 +761,9 @@ def main():
     log.info(f"NUTS: {args.num_warmup} warmup / {args.num_samples} samples / "
              f"{num_chains} chain(s)")
     log.info(f"Exact GP baseline: {'OFF' if args.no_exact_gp else 'ON'}")
+    log.info(f"Training mode: "
+             f"{'fresh (checkpoints cleared)' if args.fresh_run else 'load only (no training)' if args.load_ckpt else 'resume / train'}")
+    log.info(f"Checkpoint dir: {ckpt_dir}")
     log.info(f"Configs: {list(configs.keys())}")
     log.info(f"Results → {out_dir}")
 
@@ -778,7 +804,17 @@ def main():
     )
     remaining = train_steps - start_step
 
-    if remaining > 0:
+    if args.load_ckpt:
+        # Skip training entirely — use the loaded checkpoint as-is
+        if saved_state is None:
+            raise FileNotFoundError(
+                f"--load_ckpt: no checkpoint found at {ckpt_dir}. "
+                "Check the path and try again."
+            )
+        state = saved_state
+        log.info(f"Loaded trained network from {ckpt_dir} (step {start_step}) "
+                 "— skipping training.")
+    elif remaining > 0:
         state = train(
             rng_train, nn_model, optimizer, deep_rv_train_step,
             train_num_steps      = remaining,
