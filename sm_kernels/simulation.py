@@ -92,20 +92,22 @@ JITTER        = 5e-4
 SM_CONFIGS = {
     "slow": {
         "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.5, 0.4], [1.0, 0.8], [1.5, 1.2]],
-        "variances": [[0.5, 0.5], [0.8, 0.6], [1.0, 0.8]],
+        # Scaled by /100 for [0,100] grid: one oscillation every ~100-200 units
+        "means":     [[0.005, 0.004], [0.010, 0.008], [0.015, 0.012]],
+        # Scaled by /100: effective lengthscales of ~15-30 units on [0,100]
+        "variances": [[0.005, 0.005], [0.008, 0.006], [0.010, 0.008]],
         "label":     "SM slow (low-frequency)",
     },
     "medium": {
         "weights":   [0.5, 0.3, 0.2],
-        "means":     [[1.0, 0.8], [2.5, 1.5], [4.0, 3.0]],
-        "variances": [[0.5, 0.5], [1.0, 0.8], [1.5, 1.2]],
+        "means":     [[0.010, 0.008], [0.025, 0.015], [0.040, 0.030]],
+        "variances": [[0.005, 0.005], [0.010, 0.008], [0.015, 0.012]],
         "label":     "SM medium (mid-frequency)",
     },
     "fast": {
         "weights":   [0.5, 0.3, 0.2],
-        "means":     [[2.0, 1.5], [5.0, 3.5], [8.0, 6.0]],
-        "variances": [[0.8, 0.6], [1.2, 1.0], [2.0, 1.5]],
+        "means":     [[0.020, 0.015], [0.050, 0.035], [0.080, 0.060]],
+        "variances": [[0.008, 0.006], [0.012, 0.010], [0.020, 0.015]],
         "label":     "SM fast (high-frequency)",
     },
 }
@@ -203,14 +205,17 @@ def sm_dataloader(s, Q, batch_size=BATCH_SIZE):
         """
         raw     = random.gamma(rng_w, a=1.0, shape=(Q,))
         weights = raw / raw.sum()
-        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D)))
-        vars_   = 1.0 / random.gamma(rng_v, a=2.0, shape=(Q, D))
+        # Divide by 100 to match [0,100] grid scale:
+        # means: LogNormal(0,1)/100 gives frequencies in ~[0.003, 0.07]
+        # vars:  InvGamma(2,1)/100 gives bandwidths appropriate for [0,100] spacing
+        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D))) / 100.0
+        vars_   = 1.0 / random.gamma(rng_v, a=2.0, shape=(Q, D)) / 100.0
         K = spectral_mixture(s, s, weights, means, vars_) + jitter
         L = jnp.linalg.cholesky(K)
         z = random.normal(rng_z, shape=(batch_size, N))
         f = jnp.einsum("ij,bj->bi", L, z)
         conditionals = jnp.concatenate(
-            [weights, jnp.log(means).ravel(), jnp.log(vars_).ravel()]
+            [weights, means.ravel(), vars_.ravel()]
         )
         return z, f, conditionals
 
@@ -295,22 +300,27 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
         raw     = numpyro.sample("raw_w", dist.Gamma(jnp.ones(Q), jnp.ones(Q)))
         weights = raw / raw.sum()
         numpyro.deterministic("weights", weights)
-        means   = numpyro.sample("means",
-                      dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D))))
-        vars_   = numpyro.sample("variances",
-                      dist.InverseGamma(2.0 * jnp.ones((Q, D)),
-                                        jnp.ones((Q, D))))
-        cond    = jnp.concatenate([weights, means.ravel(), vars_.ravel()])
-        z       = numpyro.sample("z",
-                      dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
-        f       = decoder(z[None], cond, s=s_all).squeeze()
-        sigma   = numpyro.sample("sigma", dist.HalfNormal(1.0))
+        # Sample from same prior as dataloader: LogNormal(0,1)/100 and InvGamma(2,1)/100
+        means_raw = numpyro.sample("means_raw",
+                        dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D))))
+        vars_raw  = numpyro.sample("variances_raw",
+                        dist.InverseGamma(2.0 * jnp.ones((Q, D)),
+                                          jnp.ones((Q, D))))
+        means = means_raw / 100.0
+        vars_ = vars_raw  / 100.0
+        numpyro.deterministic("means",     means)
+        numpyro.deterministic("variances", vars_)
+        cond  = jnp.concatenate([weights, means.ravel(), vars_.ravel()])
+        z     = numpyro.sample("z",
+                    dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
+        f     = decoder(z[None], cond, s=s_all).squeeze()
+        sigma = numpyro.sample("sigma", dist.HalfNormal(1.0))
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma), obs=y_obs_norm)
         numpyro.deterministic("f_all", f)
 
     t0      = time.time()
     rng_key = jax.random.fold_in(rng, 0)
-    mcmc    = MCMC(NUTS(model, target_accept_prob=0.8),
+    mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=True),
                    num_warmup=num_warmup, num_samples=num_samples,
                    num_chains=num_chains,
                    chain_method="parallel" if num_chains > 1 else "sequential",
@@ -332,39 +342,34 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
 def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                              s_obs, s_test,
                              Q, num_warmup, num_samples, num_chains, rng):
-    """NUTS with exact SM GP likelihood — the gold-standard comparison.
-
-    Uses the MultivariateNormal likelihood with the full Cholesky at each step,
-    scaling as O(N_obs³). Predictions at test locations use the standard GP
-    conditional formulae applied to posterior samples of the hyperparameters.
-    """
     N_obs, D = s_obs.shape
-    N_test   = s_test.shape[0]
 
     def model():
         raw     = numpyro.sample("raw_w", dist.Gamma(jnp.ones(Q), jnp.ones(Q)))
         weights = raw / raw.sum()
         numpyro.deterministic("weights", weights)
-        means   = numpyro.sample("means",
-                      dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D))))
-        vars_   = numpyro.sample("variances",
-                      dist.InverseGamma(2.0 * jnp.ones((Q, D)),
-                                        jnp.ones((Q, D))))
-        sigma   = numpyro.sample("sigma", dist.HalfNormal(1.0))
+        # Same prior as dataloader: LogNormal(0,1)/100 and InvGamma(2,1)/100
+        means_raw = numpyro.sample("means_raw",
+                        dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D))))
+        vars_raw  = numpyro.sample("variances_raw",
+                        dist.InverseGamma(2.0 * jnp.ones((Q, D)),
+                                          jnp.ones((Q, D))))
+        means = means_raw / 100.0
+        vars_ = vars_raw  / 100.0
+        numpyro.deterministic("means_det",     means)
+        numpyro.deterministic("variances_det", vars_)
+        sigma = numpyro.sample("sigma", dist.HalfNormal(1.0))
 
         K_obs = spectral_mixture(s_obs, s_obs, weights, means, vars_) \
                 + (sigma**2 + JITTER) * jnp.eye(N_obs)
         numpyro.sample("y",
                        dist.MultivariateNormal(jnp.zeros(N_obs), K_obs),
                        obs=y_obs_norm)
-        # Store hyperparameters for post-hoc predictive
-        numpyro.deterministic("means_det",     means)
-        numpyro.deterministic("variances_det", vars_)
-        numpyro.deterministic("sigma_det",     sigma)
+        numpyro.deterministic("sigma_det", sigma)
 
     t0      = time.time()
     rng_key = jax.random.fold_in(rng, 1)
-    mcmc    = MCMC(NUTS(model, target_accept_prob=0.8),
+    mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=True),
                    num_warmup=num_warmup, num_samples=num_samples,
                    num_chains=num_chains,
                    chain_method="parallel" if num_chains > 1 else "sequential",
@@ -375,12 +380,11 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
     mcmc.print_summary()
 
     samples  = mcmc.get_samples()
-    weights_s= samples["weights"]           # [S, Q]
-    means_s  = samples["means_det"]         # [S, Q, D]
-    vars_s   = samples["variances_det"]     # [S, Q, D]
-    sigma_s  = samples["sigma_det"]         # [S]
+    weights_s= samples["weights"]
+    means_s  = samples["means_det"]
+    vars_s   = samples["variances_det"]
+    sigma_s  = samples["sigma_det"]
 
-    # GP predictive for each posterior sample
     def predict_one(w, mu, v, sig):
         K_obs  = spectral_mixture(s_obs, s_obs, w, mu, v) \
                  + (sig**2 + JITTER) * jnp.eye(N_obs)
@@ -394,9 +398,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
 
     mu_preds, std_preds = vmap(predict_one)(
         weights_s, means_s, vars_s, sigma_s
-    )   # [S, N_test]
-
-    # Rescale to original units
+    )
     mu_preds  = mu_preds  * y_std + y_mean
     std_preds = std_preds * y_std
 
@@ -794,9 +796,9 @@ def main():
     rng = random.key(args.seed)
     rng, rng_train, rng_exp = random.split(rng, 3)
 
-    # Spatial grid
+    # Spatial grid — [0,100] for numerical stability of SM kernel diff² terms
     s_all  = build_grid(
-        [{"start": 0.0, "stop": 1.0, "num": args.grid_size}] * 2
+        [{"start": 0.0, "stop": 100.0, "num": args.grid_size}] * 2
     ).reshape(-1, 2)
     loader = sm_dataloader(s_all, args.q, BATCH_SIZE)
 
