@@ -66,6 +66,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
+import dl4bi.mlp
+import flax.linen as nn
 from dl4bi_sps.utils import build_grid
 from dl4bi.core.model_output import VAEOutput
 from dl4bi.train import Callback, TrainState, train, cosine_annealing_lr
@@ -124,6 +126,16 @@ def parse_args():
     p.add_argument("--num_warmup",   type=int,   default=4000)
     p.add_argument("--num_samples",  type=int,   default=6000)
     p.add_argument("--q",            type=int,   default=3)
+    p.add_argument("--num_blks",     type=int,   default=4,
+                   help="Number of gMLP blocks (default: 4 for SM complexity)")
+    p.add_argument("--embed_dim",    type=int,   default=128,
+                   help="Embedding dimension for gMLPDeepRV (default: 128, "
+                        "dl4bi default is 64)")
+    p.add_argument("--valid_interval", type=int, default=None,
+                   help="Steps between validation checks. "
+                        "Default: train_steps // 4")
+    p.add_argument("--valid_steps",  type=int,   default=5000,
+                   help="Validation batches per check (default: 5000)")
     p.add_argument("--noise_std",    type=float, default=0.05)
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--results_dir",  type=str,   default="results")
@@ -181,20 +193,31 @@ def sm_dataloader(s, Q, batch_size=BATCH_SIZE):
     N, D   = s.shape
     jitter = JITTER * jnp.eye(N)
 
+    @jit
+    def generate_batch(rng_w, rng_mu, rng_v, rng_z):
+        """JIT-compiled batch: kernel → Cholesky → sample → conditionals.
+
+        Compiling the full pipeline lets XLA fuse the Cholesky and einsum
+        with the kernel evaluation, giving ~1.5x throughput vs calling them
+        as separate Python-level JAX ops.
+        """
+        raw     = random.gamma(rng_w, a=1.0, shape=(Q,))
+        weights = raw / raw.sum()
+        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D)))
+        vars_   = 1.0 / random.gamma(rng_v, a=2.0, shape=(Q, D))
+        K = spectral_mixture(s, s, weights, means, vars_) + jitter
+        L = jnp.linalg.cholesky(K)
+        z = random.normal(rng_z, shape=(batch_size, N))
+        f = jnp.einsum("ij,bj->bi", L, z)
+        conditionals = jnp.concatenate(
+            [weights, jnp.log(means).ravel(), jnp.log(vars_).ravel()]
+        )
+        return z, f, conditionals
+
     def dataloader(rng):
         while True:
             rng, rng_w, rng_mu, rng_v, rng_z = random.split(rng, 5)
-            raw     = random.gamma(rng_w, a=1.0, shape=(Q,))
-            weights = raw / raw.sum()
-            means   = jnp.exp(random.normal(rng_mu, shape=(Q, D)))
-            vars_   = 1.0 / random.gamma(rng_v, a=2.0, shape=(Q, D))
-            K = spectral_mixture(s, s, weights, means, vars_) + jitter
-            L = jnp.linalg.cholesky(K)
-            z = random.normal(rng_z, shape=(batch_size, N))
-            f = jnp.einsum("ij,bj->bi", L, z)
-            conditionals = jnp.concatenate(
-                [weights, means.ravel(), vars_.ravel()]
-            )
+            z, f, conditionals = generate_batch(rng_w, rng_mu, rng_v, rng_z)
             yield {"s": s, "z": z, "conditionals": conditionals, "f": f}
 
     return dataloader
@@ -741,6 +764,7 @@ def main():
     ckpt_dir  = args.ckpt_dir or str(
         Path(args.results_dir) /
         f"sim_checkpoints_grid{args.grid_size}_q{args.q}"
+        f"_blks{args.num_blks}_emb{args.embed_dim}"
     )
 
     # Override ckpt_dir if loading from a specific checkpoint
@@ -785,7 +809,13 @@ def main():
         "exact_gp_baseline": not args.no_exact_gp,
     })
 
-    nn_model  = gMLPDeepRV(num_blks=2)
+    nn_model  = gMLPDeepRV(
+        num_blks = args.num_blks,
+        embed    = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
+        proj_out = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
+    )
+    log.info(f"Architecture: gMLPDeepRV("
+             f"num_blks={args.num_blks}, embed_dim={args.embed_dim})")
     optimizer = optax.chain(
         optax.clip_by_global_norm(3.0),
         optax.adamw(cosine_annealing_lr(train_steps, lr), weight_decay=1e-2),
@@ -815,16 +845,19 @@ def main():
         log.info(f"Loaded trained network from {ckpt_dir} (step {start_step}) "
                  "— skipping training.")
     elif remaining > 0:
+        valid_interval = args.valid_interval or max(train_steps // 4, 1)
+        log.info(f"Validation: every {valid_interval} steps, "
+                 f"{args.valid_steps} batches per check")
         state = train(
             rng_train, nn_model, optimizer, deep_rv_train_step,
             train_num_steps      = remaining,
             train_dataloader     = loader,
             valid_step           = valid_step,
-            valid_interval       = 10_000,
-            valid_num_steps      = 200,
+            valid_interval       = valid_interval,
+            valid_num_steps      = args.valid_steps,
             valid_dataloader     = loader,
             valid_monitor_metric = "norm MSE",
-            callbacks            = [make_save_callback(ckpt_dir, 10_000)],
+            callbacks            = [make_save_callback(ckpt_dir, valid_interval)],
             state                = saved_state,
             return_state         = "best",
         )
