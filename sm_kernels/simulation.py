@@ -159,6 +159,15 @@ def parse_args():
     # Baselines
     p.add_argument("--no_exact_gp", action="store_true",
                    help="Skip exact GP baseline")
+    # Masking
+    p.add_argument("--mask_type",     type=str,   default="contiguous",
+                   choices=["contiguous", "random"],
+                   help="Masking strategy: contiguous (harder extrapolation, "
+                        "paper default) or random (realistic TROPOMI missingness)")
+    p.add_argument("--mask_fraction", type=float, default=0.5,
+                   help="Fraction of grid to mask (default: 0.5). "
+                        "Only applies to contiguous masking — controls block size. "
+                        "E.g. 0.25 masks a smaller block, 0.5 masks ~half the grid.")
     # Misc
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--results_dir", type=str,   default="results")
@@ -247,16 +256,24 @@ def sm_dataloader(s, Q, batch_size=BATCH_SIZE):
 # Masking
 # =============================================================================
 
-def contiguous_mask(grid_size, rng_key=None):
-    """~50% contiguous rectangular mask (harder extrapolation task)."""
+def contiguous_mask(grid_size, mask_fraction=0.5, rng_key=None):
+    """Contiguous rectangular mask.
+
+    Args:
+        grid_size:     number of grid points per side
+        mask_fraction: fraction of grid to mask (default 0.5 = ~50%).
+                       Controls block size — smaller values give a smaller
+                       masked block, reducing extrapolation difficulty.
+        rng_key:       JAX random key for random block placement
+    """
     N        = grid_size ** 2
-    n_masked = int(N * MASK_FRACTION)
+    n_masked = int(N * mask_fraction)
     rect_h   = min(int(np.sqrt(n_masked)), grid_size)
     rect_w   = min(int(np.ceil(n_masked / rect_h)), grid_size)
     seed     = int(jax.random.bits(rng_key)) if rng_key is not None else 0
     rng_np   = np.random.default_rng(seed)
-    row0     = rng_np.integers(0, grid_size - rect_h + 1)
-    col0     = rng_np.integers(0, grid_size - rect_w + 1)
+    row0     = rng_np.integers(0, max(grid_size - rect_h, 0) + 1)
+    col0     = rng_np.integers(0, max(grid_size - rect_w, 0) + 1)
     mask     = np.zeros((grid_size, grid_size), dtype=bool)
     mask[row0:row0 + rect_h, col0:col0 + rect_w] = True
     flat     = mask.ravel()
@@ -283,7 +300,7 @@ def random_mask(grid_size, rng_key=None):
 # =============================================================================
 
 def generate_observations(s_all, grid_size, sm_config, noise_std, rng,
-                           mask_type="contiguous"):
+                           mask_type="contiguous", mask_fraction=0.5):
     """Sample GP from true SM kernel, add noise, standardise."""
     N_all = s_all.shape[0]
     rng, rng_f, rng_y, rng_mask = random.split(rng, 4)
@@ -301,7 +318,9 @@ def generate_observations(s_all, grid_size, sm_config, noise_std, rng,
         raise ValueError("f_all contains NaN — kernel near-singular.")
 
     if mask_type == "contiguous":
-        obs_idx, tst_idx = contiguous_mask(grid_size, rng_key=rng_mask)
+        obs_idx, tst_idx = contiguous_mask(grid_size,
+                                           mask_fraction=mask_fraction,
+                                           rng_key=rng_mask)
     else:
         obs_idx, tst_idx = random_mask(grid_size, rng_key=rng_mask)
 
@@ -705,7 +724,9 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
     # Generate data
     y_obs_norm, y_mean, y_std, f_all, true_cond, obs_idx, tst_idx = \
         generate_observations(s_all, args.grid_size, sm_config,
-                              args.noise_std, rng_data)
+                              args.noise_std, rng_data,
+                              mask_type=args.mask_type,
+                              mask_fraction=args.mask_fraction)
     f_test = f_all[tst_idx]
     log.info(f"Observed: {len(obs_idx)}  Held-out: {len(tst_idx)}")
 
