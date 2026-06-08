@@ -1,4 +1,3 @@
-.venv
 .DS_Store
 benchmarks/vae/.DS_Store
 benchmarks/vae/maps/
@@ -9,3 +8,4 @@ dl4bi/core/__pycache__/
 dl4bi/vae/__pycache__/
 sm_kernels/data/
 uv.lock
+sm_kernel_env
