@@ -1,9 +1,9 @@
 """
 SM-DeepRV Simulation Experiment
 ================================
-Evaluates SM-DeepRV using the same experimental structure as the DeepRV paper
-(Section 6.1 / Appendix B.1), extended to a Spectral Mixture kernel and a
-Gaussian likelihood appropriate for continuous air quality measurements.
+Evaluates SM-DeepRV using the same experimental structure as DeepRV (Navott et al 2025), 
+extended to a Spectral Mixture kernel and a Gaussian likelihood appropriate for continuous
+air quality measurements.
 
 Compares three methods:
   1. SM-DeepRV (NUTS) — surrogate-accelerated inference (this work)
@@ -18,9 +18,23 @@ Fair timing comparison:
   The only difference per NUTS step is:
     SM-DeepRV : O(N²) decoder forward pass
     Exact GP  : O(N³) Cholesky decomposition
-  This matches the paper's setup and makes the timing comparison meaningful.
 
-Usage
+Domain and parameterisation
+---------------------------
+Inputs live on the unit square [0, 1]². SM hyperparameters are expressed
+directly in [0,1]-unit terms.
+
+Lengthscale prior (Betancourt §3.2.3)
+  The variance parameter v of each SM mixture component is derived from a
+  lengthscale ℓ via  v = 1 / (2π²ℓ²),  where ℓ is given a calibrated
+  InverseGamma prior whose α and β are chosen so that:
+    P(ℓ < ℓ_min) ≈ 0.1   (suppress sub-grid-spacing frequencies)
+    P(ℓ > ℓ_max) ≈ 0.1   (suppress non-identified long-range trends)
+  with ℓ_min / ℓ_max taken from the pairwise distance range of the grid.
+  This replaces the previous IG(2,1)/1000 heuristic and removes all
+  ad-hoc scaling from the priors.
+
+Usage (run from CLI; can replace CUDA_VISIBLE_DEVICES value as needed)
 -----
     # Full run — all three SM configurations
     CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 16 \\
@@ -31,11 +45,11 @@ Usage
         --num_blks 2 --embed_dim 64 \\
         --load_ckpt results/sim_checkpoints_grid16_q3_blks2_emb64
 
-    # Quick sanity check
+    # Quick run (to check installs)
     CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 8 --sm_config medium \\
         --train_steps 5000 --num_warmup 100 --num_samples 200
 
-    # Skip exact GP baseline (faster development)
+    # Skip exact GP baseline (faster for development)
     CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 16 --no_exact_gp
 
     # Include ADVI
@@ -56,6 +70,9 @@ from datetime import datetime
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap, random
+import scipy.spatial.distance as spd
+from scipy.optimize import root
+from scipy.stats import invgamma
 
 import numpyro
 import numpyro.distributions as dist
@@ -94,26 +111,30 @@ MASK_FRACTION = 0.5
 BATCH_SIZE    = 32
 JITTER        = 5e-4
 
-# SM configurations for the [0,100] grid with /1,000 variance scaling.
-# Variances are chosen to give adjacent-point correlations in the range
-# 0.35–0.84 (meaningful spatial variation, not white-noise or near-constant).
+# SM configurations for the [0,1]² grid.
+# Parameters are expressed directly in [0,1]-unit termss.
+# Frequencies (means) have units of cycles per unit length.
+# Variances enter the kernel as exp(-2π²v·Δ²); they are derived from
+# lengthscales ℓ via  v = 1/(2π²ℓ²)  at the SM_CONFIGS values below.
+# Chosen to give adjacent-point correlations in the range 0.35–0.84
+# (meaningful spatial variation, not white-noise or near-constant).
 SM_CONFIGS = {
     "slow": {
         "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.005, 0.004], [0.010, 0.008], [0.015, 0.012]],
-        "variances": [[2e-4, 2e-4],   [3e-4, 2.5e-4], [4e-4, 3e-4]],
+        "means":     [[0.5, 0.4], [1.0, 0.8], [1.5, 1.2]],
+        "variances": [[2.0, 2.0], [3.0, 2.5], [4.0, 3.0]],
         "label":     "SM slow (low-frequency)",
     },
     "medium": {
         "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.010, 0.008], [0.025, 0.015], [0.040, 0.030]],
-        "variances": [[4e-4, 3e-4],   [6e-4, 5e-4],   [8e-4, 6e-4]],
+        "means":     [[1.0, 0.8], [2.5, 1.5], [4.0, 3.0]],
+        "variances": [[4.0, 3.0], [6.0, 5.0], [8.0, 6.0]],
         "label":     "SM medium (mid-frequency)",
     },
     "fast": {
         "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.020, 0.015], [0.050, 0.035], [0.080, 0.060]],
-        "variances": [[6e-4, 5e-4],   [8e-4, 6e-4],   [1.2e-3, 1e-3]],
+        "means":     [[2.0, 1.5], [5.0, 3.5], [8.0, 6.0]],
+        "variances": [[6.0, 5.0], [8.0, 6.0], [12.0, 10.0]],
         "label":     "SM fast (high-frequency)",
     },
 }
@@ -194,7 +215,7 @@ def paper_lr(grid_size, override=None):
 
 
 def paper_num_chains():
-    """Single chain — limited to one GPU."""
+    """Single chain — limited to one GPU. Adapt if multiple are available."""
     return 1
 
 
@@ -220,22 +241,126 @@ def spectral_mixture(x, y, weights, means, variances):
 # Training dataloader
 # =============================================================================
 
-def sm_dataloader(s, Q, batch_size=BATCH_SIZE):
-    """JIT-compiled SM kernel dataloader for the [0,100] grid.
+def calibrated_ig_params(s, lower_q=0.1, upper_q=0.1):
+    """Compute calibrated InverseGamma(alpha, beta) parameters for each input
+    dimension, robust across grid sizes.
 
-    Hyperparameter scaling for [0,100] grid:
-      means    : LogNormal(0,1) / 100    →  frequencies in ~[0.003, 0.07]
-      variances: InvGamma(2,1)  / 1,000  →  adjacent correlation ~0.35–0.84
+    Solves for (alpha, beta) such that:
+      P(ell < ell_lo) = lower_q
+      P(ell > ell_hi) = upper_q
+    where ell_lo / ell_hi are the min / max pairwise distances in that
+    dimension.
+
+    Uses scipy.optimize.root in log-space with a grid of starting points
+    to avoid local-minimum traps that afflict fsolve on extreme distance
+    ratios (large grids).
+    """
+    s_np = np.array(s)
+    D    = s_np.shape[1]
+    params = []
+
+    for d in range(D):
+        col   = s_np[:, d:d+1]
+        dists = spd.pdist(col)
+        dists = dists[dists > 0]
+        ell_lo = float(np.min(dists))
+        ell_hi = float(np.max(dists))
+
+        # Work in log-space: both alpha and beta must be strictly positive,
+        # and can vary over several orders of magnitude with large grids.
+        def equations_log(log_ab):
+            a = np.exp(log_ab[0])
+            b = np.exp(log_ab[1])
+            return [
+                invgamma.cdf(ell_lo, a=a, scale=b) - lower_q,
+                invgamma.cdf(ell_hi, a=a, scale=b) - (1.0 - upper_q),
+            ]
+
+        # Grid of starting points in log-space, covering a wide range.
+        # For a G×G grid on [0,1], beta should be O(ell_lo) to O(ell_hi),
+        # so we sweep log(b) across that range; alpha controls the spread
+        # and is typically in [1, 20].
+        best_result = None
+        best_resid  = np.inf
+        for log_a0 in np.log([1.5, 3.0, 7.0, 15.0]):
+            for log_b0 in np.log([ell_lo, np.sqrt(ell_lo * ell_hi),
+                                   ell_hi / 2, ell_hi]):
+                try:
+                    res = root(equations_log, [log_a0, log_b0], method="hybr")
+                    resid = np.max(np.abs(res.fun))
+                    if res.success and resid < best_resid:
+                        best_resid  = resid
+                        best_result = res
+                except Exception:
+                    continue
+
+        if best_result is not None and best_resid < 1e-6:
+            a = float(np.exp(best_result.x[0]))
+            b = float(np.exp(best_result.x[1]))
+            log.info(
+                f"  Calibrated IG dim {d}: IG({a:.3f}, {b:.5f})  "
+                f"[ell_lo={ell_lo:.5f}, ell_hi={ell_hi:.4f}]  "
+                f"residual={best_resid:.2e}"
+            )
+        else:
+            # Fallback: IG(3, geometric_mean) — keeps prior centred on
+            # the midpoint of the distance range in log-space.
+            a = 3.0
+            b = float(np.sqrt(ell_lo * ell_hi))
+            log.warning(
+                f"  Calibrated IG dim {d}: solver failed "
+                f"(best residual={best_resid:.2e}). "
+                f"Falling back to IG({a:.3f}, {b:.5f})."
+            )
+        params.append((a, b))
+
+    return params
+
+
+def sm_dataloader(s, Q, ig_params, batch_size=BATCH_SIZE):
+    """JIT-compiled SM kernel dataloader for the [0,1]² grid.
+
+    Hyperparameters are sampled in interpretable physical units with no
+    post-hoc scaling:
+      weights : Dirichlet-like (Gamma normalised)
+      means   : LogNormal(0, 1)  — frequencies in cycles per unit length
+      ells    : InverseGamma(alpha_d, beta_d)  — lengthscales in [0,1] units
+      vars_   : 1 / (2π²ℓ²)  — derived, passed directly to the kernel
+
+    Args:
+        s:          input locations, shape [N, D]
+        Q:          number of SM mixture components
+        ig_params:  list of (alpha_d, beta_d) from calibrated_ig_params()
+        batch_size: training batch size
     """
     N, D   = s.shape
     jitter = JITTER * jnp.eye(N)
 
+    # Extract IG parameters as static JAX arrays for use inside JIT
+    ig_alpha = jnp.array([p[0] for p in ig_params])   # shape (D,)
+    ig_beta  = jnp.array([p[1] for p in ig_params])   # shape (D,)
+
     @jit
     def generate_batch(rng_w, rng_mu, rng_v, rng_z):
+        # Weights
         raw     = random.gamma(rng_w, a=1.0, shape=(Q,))
         weights = raw / raw.sum()
-        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D))) / 100.0
-        vars_   = 1.0 / random.gamma(rng_v, a=2.0, shape=(Q, D)) / 1_000.0
+
+        # Frequencies: LogNormal(0,1) — correct scale for [0,1] domain
+        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D)))
+
+        # Lengthscales: calibrated InverseGamma, one per dimension
+        # Sample shape (Q, D): each component gets its own ell per dimension
+        u     = random.uniform(rng_v, shape=(Q, D))   # uniform for inversion
+        # InverseGamma CDF inversion: IG(a,b) = 1/Gamma(a, rate=1/b)
+        # JAX has no InverseGamma; sample Gamma then invert
+        g     = random.gamma(rng_v, a=ig_alpha[None, :],  # broadcast to (Q,D)
+                             shape=(Q, D))
+        ells  = ig_beta[None, :] / g                       # shape (Q, D)
+
+        # Derive kernel variance: v = 1 / (2π²ℓ²)
+        vars_ = 1.0 / (2.0 * jnp.pi**2 * ells**2 + 1e-10)
+
         K = spectral_mixture(s, s, weights, means, vars_) + jitter
         L = jnp.linalg.cholesky(K)
         z = random.normal(rng_z, shape=(batch_size, N))
@@ -338,26 +463,46 @@ def generate_observations(s_all, grid_size, sm_config, noise_std, rng,
 # Shared NUTS model (hyperparameter priors)
 # =============================================================================
 
-def _sm_hyperparameter_priors(Q, D):
+def _sm_hyperparameter_priors(Q, D, ig_params):
     """Sample SM hyperparameters from the same prior as the dataloader.
 
-    Returns (weights, means, vars_, cond) where means and vars_ are already
-    scaled to the [0,100] grid.
+    Parameterisation (Betancourt §3.2.3, [0,1] domain):
+      weights  : normalised Gamma  (Dirichlet-like)
+      means    : LogNormal(0,1)    — frequencies in cycles per unit length
+      ells     : InverseGamma(alpha_d, beta_d)  — calibrated lengthscale prior
+      vars_    : 1/(2π²ℓ²)        — derived deterministically, no scaling
+
+    ig_params: list of (alpha_d, beta_d) from calibrated_ig_params(), length D.
+
+    Returns (weights, means, vars_, cond) where vars_ is ready to pass
+    directly into spectral_mixture().
     """
-    raw       = numpyro.sample("raw_w",
-                    dist.Gamma(jnp.ones(Q), jnp.ones(Q)))
-    weights   = raw / raw.sum()
+    raw     = numpyro.sample("raw_w", dist.Gamma(jnp.ones(Q), jnp.ones(Q)))
+    weights = raw / raw.sum()
     numpyro.deterministic("weights", weights)
-    means_raw = numpyro.sample("means_raw",
-                    dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D))))
-    vars_raw  = numpyro.sample("variances_raw",
-                    dist.InverseGamma(2.0 * jnp.ones((Q, D)),
-                                      jnp.ones((Q, D))))
-    means = means_raw / 100.0
-    vars_ = vars_raw  / 1_000.0
-    numpyro.deterministic("means",     means)
+
+    means = numpyro.sample(
+        "means",
+        dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D)))
+    )
+
+    # Sample one lengthscale per (component, dimension) with calibrated IG.
+    # numpyro's InverseGamma(concentration=alpha, rate=beta) matches the
+    # parameterisation used in calibrated_ig_params().
+    ig_alpha = jnp.array([p[0] for p in ig_params])   # shape (D,)
+    ig_beta  = jnp.array([p[1] for p in ig_params])   # shape (D,)
+    ells = numpyro.sample(
+        "ells",
+        dist.InverseGamma(
+            jnp.broadcast_to(ig_alpha[None, :], (Q, D)),
+            jnp.broadcast_to(ig_beta[None,  :], (Q, D)),
+        )
+    )
+
+    vars_ = 1.0 / (2.0 * jnp.pi**2 * ells**2 + 1e-10)
     numpyro.deterministic("variances", vars_)
-    cond  = jnp.concatenate([weights, means.ravel(), vars_.ravel()])
+
+    cond = jnp.concatenate([weights, means.ravel(), vars_.ravel()])
     return weights, means, vars_, cond
 
 
@@ -367,7 +512,7 @@ def _sm_hyperparameter_priors(Q, D):
 
 def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
                           s_all, obs_idx, tst_idx,
-                          Q, num_warmup, num_samples, num_chains, rng,
+                          Q, ig_params, num_warmup, num_samples, num_chains, rng,
                           partial_dense_mass=False):
     """NUTS over (z, θ, σ) using the surrogate decoder.
 
@@ -376,20 +521,22 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
     N_all, D = s_all.shape
 
     def model():
-        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D)
+        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D, ig_params)
         z         = numpyro.sample("z",
                         dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f         = decoder(z[None], cond, s=s_all).squeeze()
-        log_sigma = numpyro.sample("log_sigma", dist.Normal(-2.0, 1.0))
+        log_sigma = numpyro.sample("log_sigma", dist.Normal(-3.0, 0.5))
         sigma     = jnp.exp(log_sigma)
         numpyro.deterministic("sigma", sigma)
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma), obs=y_obs_norm)
         numpyro.deterministic("f_all", f)
 
-    dense_mass = ([["means_raw", "variances_raw", "raw_w", "log_sigma"]]
-                  if partial_dense_mass else True)
+    dense_mass = (
+        [("means", "ells", "raw_w", "log_sigma")]
+        if partial_dense_mass else True
+    )
     t0      = time.time()
-    mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=dense_mass),
+    mcmc    = MCMC(NUTS(model, target_accept_prob=0.9, dense_mass=dense_mass),
                    num_warmup=num_warmup, num_samples=num_samples,
                    num_chains=num_chains,
                    chain_method="parallel" if num_chains > 1 else "sequential",
@@ -410,7 +557,7 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
 
 def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                              s_all, obs_idx, tst_idx,
-                             Q, num_warmup, num_samples, num_chains, rng,
+                             Q, ig_params, num_warmup, num_samples, num_chains, rng,
                              partial_dense_mass=False):
     """NUTS over (z, θ, σ) using the exact SM Cholesky.
 
@@ -420,7 +567,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
     N_all, D = s_all.shape
 
     def model():
-        weights, means, vars_, _ = _sm_hyperparameter_priors(Q, D)
+        weights, means, vars_, _ = _sm_hyperparameter_priors(Q, D, ig_params)
         # Compute exact SM kernel and Cholesky — O(N³) per step
         K         = spectral_mixture(s_all, s_all, weights, means, vars_) \
                     + JITTER * jnp.eye(N_all)
@@ -428,16 +575,18 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
         z         = numpyro.sample("z",
                         dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f         = L @ z
-        log_sigma = numpyro.sample("log_sigma", dist.Normal(-2.0, 1.0))
+        log_sigma = numpyro.sample("log_sigma", dist.Normal(-3.0, 0.5))
         sigma     = jnp.exp(log_sigma)
         numpyro.deterministic("sigma", sigma)
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma), obs=y_obs_norm)
         numpyro.deterministic("f_all", f)
 
-    dense_mass = ([["means_raw", "variances_raw", "raw_w", "log_sigma"]]
-                  if partial_dense_mass else True)
+    dense_mass = (
+        [("means", "ells", "raw_w", "log_sigma")]
+        if partial_dense_mass else True
+    )
     t0      = time.time()
-    mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=dense_mass),
+    mcmc    = MCMC(NUTS(model, target_accept_prob=0.9, dense_mass=dense_mass),
                    num_warmup=num_warmup, num_samples=num_samples,
                    num_chains=num_chains,
                    chain_method="parallel" if num_chains > 1 else "sequential",
@@ -457,7 +606,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
 # =============================================================================
 
 def advi_inference(decoder, y_obs_norm, y_mean, y_std,
-                   s_all, obs_idx, tst_idx, Q,
+                   s_all, obs_idx, tst_idx, Q, ig_params,
                    num_steps, lr, num_samples, rng):
     """ADVI with AutoMultivariateNormal — paper's variational baseline.
 
@@ -467,13 +616,11 @@ def advi_inference(decoder, y_obs_norm, y_mean, y_std,
     N_all, D = s_all.shape
 
     def model():
-        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D)
+        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D, ig_params)
         z         = numpyro.sample("z",
                         dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f         = decoder(z[None], cond, s=s_all).squeeze()
-        log_sigma = numpyro.sample("log_sigma", dist.Normal(-2.0, 1.0))
-        sigma     = jnp.exp(log_sigma)
-        numpyro.deterministic("sigma", sigma)
+        sigma = numpyro.sample("sigma", dist.HalfNormal(0.1))
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma), obs=y_obs_norm)
         numpyro.deterministic("f_all", f)
 
@@ -717,7 +864,7 @@ def load_latest_checkpoint(ckpt_dir, model, optimizer, loader):
 # =============================================================================
 
 def run_single_config(args, s_all, decoder, config_name, sm_config,
-                      out_dir, num_chains, rng):
+                      out_dir, num_chains, ig_params, rng):
     log.info(f"\n--- SM config: {config_name} ({sm_config['label']}) ---")
     rng, rng_data, rng_drv, rng_egp, rng_advi = random.split(rng, 5)
 
@@ -743,7 +890,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
     drv_mean, drv_std, drv_samples, drv_time = deeprv_nuts_inference(
         decoder, y_obs_norm, y_mean, y_std,
         s_all, obs_idx, tst_idx,
-        args.q, args.num_warmup, args.num_samples, num_chains, rng_drv,
+        args.q, ig_params, args.num_warmup, args.num_samples, num_chains, rng_drv,
         partial_dense_mass=args.partial_dense_mass,
     )
     for name, arr in [("drv_mean",    drv_mean),
@@ -764,7 +911,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         egp_mean, egp_std, egp_samples, egp_time = exact_gp_nuts_inference(
             y_obs_norm, y_mean, y_std,
             s_all, obs_idx, tst_idx,
-            args.q, args.num_warmup, args.num_samples, num_chains, rng_egp,
+            args.q, ig_params, args.num_warmup, args.num_samples, num_chains, rng_egp,
             partial_dense_mass=args.partial_dense_mass,
         )
         for name, arr in [("egp_mean",    egp_mean),
@@ -783,7 +930,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         log.info(f"Running ADVI ({args.advi_steps} steps, lr={args.advi_lr}) …")
         advi_mean, advi_std, advi_samples, advi_time, advi_losses = advi_inference(
             decoder, y_obs_norm, y_mean, y_std,
-            s_all, obs_idx, tst_idx, args.q,
+            s_all, obs_idx, tst_idx, args.q, ig_params,
             args.advi_steps, args.advi_lr, args.advi_samples, rng_advi,
         )
         for name, arr in [("advi_mean",   advi_mean),
@@ -867,9 +1014,25 @@ def main():
     rng, rng_train, rng_exp = random.split(rng, 3)
 
     s_all  = build_grid(
-        [{"start": 0.0, "stop": 100.0, "num": args.grid_size}] * 2
+        [{"start": 0.0, "stop": 1.0, "num": args.grid_size}] * 2
     ).reshape(-1, 2)
-    loader = sm_dataloader(s_all, args.q, BATCH_SIZE)
+
+    ig_params = calibrated_ig_params(s_all)
+    for d, (a, b) in enumerate(ig_params):
+        p_lo = float(invgamma.cdf(
+            float(np.min(spd.pdist(np.array(s_all)[:, d:d+1]))), a=a, scale=b))
+        p_hi = float(1 - invgamma.cdf(
+            float(np.max(spd.pdist(np.array(s_all)[:, d:d+1]))), a=a, scale=b))
+    log.info(f"  IG prior dim {d}: "
+             f"P(ell<ell_lo)={p_lo:.3f}, P(ell>ell_hi)={p_hi:.3f} "
+             f"(target both ~0.1)")
+    log.info(
+        "Calibrated IG lengthscale prior: "
+        + "  ".join(f"d{d}: IG({a:.2f}, {b:.4f})"
+                    for d, (a, b) in enumerate(ig_params))
+    )
+
+    loader = sm_dataloader(s_all, args.q, ig_params, BATCH_SIZE)
 
     # --- Train ---
     log.info("\n=== Training SM-DeepRV ===")
@@ -941,7 +1104,7 @@ def main():
         rng_exp, rng_cfg = random.split(rng_exp)
         row = run_single_config(
             args, s_all, decoder, config_name, sm_config,
-            out_dir, num_chains, rng_cfg,
+            out_dir, num_chains, ig_params, rng_cfg,
         )
         all_rows.append(row)
         speedup = ((row.get("egp_time_s") or float("nan")) /
