@@ -9,3 +9,4 @@ dl4bi/vae/__pycache__/
 sm_kernels/data/
 uv.lock
 sm_kernel_env
+prior_geometry.pdf

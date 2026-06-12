@@ -98,10 +98,7 @@ BATCH_SIZE    = 32
 JITTER        = 5e-4
 
 # SM configurations for the [0,1]² grid.
-# Parameters are expressed directly in [0,1]-unit terms (no post-hoc scaling).
-# Frequencies (means) have units of cycles per unit length.
-# Variances enter the kernel as exp(-2π²v·Δ²); derived from lengthscales
-# via v = 1/(2π²ℓ²).
+# Parameters are in [0,1]-unit terms, consistent with calibrated_ig_params().
 SM_CONFIGS = {
     "slow": {
         "weights":   [0.5, 0.3, 0.2],
@@ -162,9 +159,6 @@ def parse_args():
     p.add_argument("--advi_lr",     type=float, default=1e-4)
     p.add_argument("--advi_samples",type=int,   default=6000)
     # Baselines
-    p.add_argument("--uninformative_prior", action="store_true",
-                        help="Use IG(2,1) prior on lengthscales instead of "
-                             "calibrated Betancourt prior (for comparison only)")
     p.add_argument("--no_exact_gp", action="store_true",
                    help="Skip exact GP baseline")
     # Masking
@@ -231,14 +225,10 @@ def spectral_mixture(x, y, weights, means, variances):
 # =============================================================================
 
 def calibrated_ig_params(s, lower_q=0.1, upper_q=0.1):
-    """Compute InverseGamma(alpha, beta) parameters for the Betancourt
-    lengthscale prior (§3.2.3), robust across grid sizes.
-
-    Solves for (alpha, beta) such that:
-      P(ell < ell_lo) = lower_q
-      P(ell > ell_hi) = upper_q
-    where ell_lo / ell_hi are the min / max pairwise distances per dimension.
-    Works in log-space for numerical stability across all grid sizes.
+    """Compute InverseGamma(alpha, beta) parameters for the lengthscale ell,
+    such that P(ell < delta_min) = lower_q and P(ell > delta_max) = upper_q,
+    where delta_min / delta_max are the min / max pairwise distances per
+    dimension. v is then derived as 1/(2π²ℓ²).
     """
     s_np = np.array(s)
     D    = s_np.shape[1]
@@ -288,29 +278,39 @@ def calibrated_ig_params(s, lower_q=0.1, upper_q=0.1):
 
 
 def sm_dataloader(s, Q, ig_params, batch_size=BATCH_SIZE):
-    """JIT-compiled SM kernel dataloader for the [0,1]² grid.
+    """JIT-compiled SM kernel dataloader. Works on any grid scale.
 
-    Hyperparameters are sampled in interpretable physical units:
+    Hyperparameter sampling:
       weights : Dirichlet-like (Gamma normalised)
-      means   : LogNormal(0, 1)  — frequencies in cycles per unit length
-      ells    : InverseGamma(alpha_d, beta_d) — calibrated lengthscales
-      vars_   : 1 / (2π²ℓ²) — derived, passed directly to the kernel
+      means   : LogNormal(0,1) * delta  — frequencies scaled to grid spacing
+      ells    : InverseGamma(alpha_d, beta_d) from calibrated_ig_params()
+      vars_   : 1 / (2π²ℓ²) — derived from ells
 
-    ig_params: list of (alpha_d, beta_d) from calibrated_ig_params().
+    Conditionals are log-transformed: [weights, log(means), log(vars_)].
     """
     N, D   = s.shape
     jitter = JITTER * jnp.eye(N)
+
+    s_np    = np.array(s)
+    dists   = spd.pdist(s_np[:, :1])
+    delta   = float(np.min(dists[dists > 0]))
+    means_scale = delta
+
     ig_alpha = jnp.array([p[0] for p in ig_params])
     ig_beta  = jnp.array([p[1] for p in ig_params])
+    v_floor  = 0.05 / delta**2   # ensures v*delta_min² >= 0.05
 
     @jit
     def generate_batch(rng_w, rng_mu, rng_v, rng_z):
         raw     = random.gamma(rng_w, a=1.0, shape=(Q,))
         weights = raw / raw.sum()
-        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D)))
-        g     = random.gamma(rng_v, a=ig_alpha[None, :], shape=(Q, D))
-        ells  = ig_beta[None, :] / g
-        vars_ = 1.0 / (2.0 * jnp.pi**2 * ells**2 + 1e-6)
+        means   = jnp.exp(random.normal(rng_mu, shape=(Q, D))) * means_scale
+        g       = random.gamma(rng_v, a=ig_alpha[None, :], shape=(Q, D))
+        ells    = ig_beta[None, :] / g
+        vars_   = jnp.maximum(
+            1.0 / (2.0 * jnp.pi**2 * ells**2 + 1e-10),
+            v_floor,
+        )
         K = spectral_mixture(s, s, weights, means, vars_) + jitter
         L = jnp.linalg.cholesky(K)
         z = random.normal(rng_z, shape=(batch_size, N))
@@ -416,16 +416,13 @@ def generate_observations(s_all, grid_size, sm_config, noise_std, rng,
 # Shared NUTS model (hyperparameter priors)
 # =============================================================================
 
-def _sm_hyperparameter_priors(Q, D, ig_params):
-    """Sample SM hyperparameters from the same prior as the dataloader.
+def _sm_hyperparameter_priors(Q, D, ig_params, means_scale):
+    """Sample SM hyperparameters matching the dataloader prior exactly.
 
-    Parameterisation (Betancourt §3.2.3, [0,1] domain):
-      weights  : normalised Gamma
-      means    : LogNormal(0,1) — frequencies in cycles per unit length
-      ells     : InverseGamma(alpha_d, beta_d) — calibrated lengthscale prior
-      vars_    : 1/(2π²ℓ²) — derived deterministically, no scaling
-
-    ig_params: list of (alpha_d, beta_d) from calibrated_ig_params().
+    weights : normalised Gamma
+    means   : LogNormal(0,1) * means_scale
+    ells    : InverseGamma(alpha_d, beta_d) from calibrated_ig_params()
+    vars_   : 1/(2π²ℓ²) — derived from ells, same as dataloader
     """
     raw     = numpyro.sample("raw_w", dist.Gamma(jnp.ones(Q), jnp.ones(Q)))
     weights = raw / raw.sum()
@@ -434,7 +431,7 @@ def _sm_hyperparameter_priors(Q, D, ig_params):
     means = numpyro.sample(
         "means",
         dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D)))
-    )
+    ) * means_scale
 
     ig_alpha = jnp.array([p[0] for p in ig_params])
     ig_beta  = jnp.array([p[1] for p in ig_params])
@@ -460,7 +457,7 @@ def _sm_hyperparameter_priors(Q, D, ig_params):
 
 def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
                           s_all, obs_idx, tst_idx,
-                          Q, ig_params, noise_std,
+                          Q, ig_params, means_scale, noise_std,
                           num_warmup, num_samples, num_chains, rng,
                           partial_dense_mass=False):
     """NUTS over (z, θ) using the surrogate decoder.
@@ -476,14 +473,14 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
     sigma_fixed = noise_std / y_std   # fixed: known generative noise, normalised
 
     def model():
-        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D, ig_params)
+        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D, ig_params, means_scale)
         z = numpyro.sample("z",
                 dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f = decoder(z[None], cond, s=s_all).squeeze()
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma_fixed), obs=y_obs_norm)
         numpyro.deterministic("f_all", f)
 
-    dense_mass = ([["means", "ells", "raw_w"]]
+    dense_mass = ([["means", "variances", "raw_w"]]
                   if partial_dense_mass else True)
     t0      = time.time()
     mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=dense_mass),
@@ -508,7 +505,7 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
 
 def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                              s_all, obs_idx, tst_idx,
-                             Q, ig_params, noise_std,
+                             Q, ig_params, means_scale, noise_std,
                              num_warmup, num_samples, num_chains, rng,
                              partial_dense_mass=False):
     """NUTS over (z, θ) using the exact SM Cholesky.
@@ -523,7 +520,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
     sigma_fixed = noise_std / y_std   # fixed: known generative noise, normalised
 
     def model():
-        weights, means, vars_, _ = _sm_hyperparameter_priors(Q, D, ig_params)
+        weights, means, vars_, _ = _sm_hyperparameter_priors(Q, D, ig_params, means_scale)
         K = spectral_mixture(s_all, s_all, weights, means, vars_) \
             + JITTER * jnp.eye(N_all)
         L = jnp.linalg.cholesky(K)
@@ -533,7 +530,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma_fixed), obs=y_obs_norm)
         numpyro.deterministic("f_all", f)
 
-    dense_mass = ([["means", "ells", "raw_w"]]
+    dense_mass = ([["means", "variances", "raw_w"]]
                   if partial_dense_mass else True)
     t0      = time.time()
     mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=dense_mass),
@@ -557,7 +554,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
 # =============================================================================
 
 def advi_inference(decoder, y_obs_norm, y_mean, y_std,
-                   s_all, obs_idx, tst_idx, Q, ig_params, noise_std,
+                   s_all, obs_idx, tst_idx, Q, ig_params, means_scale, noise_std,
                    num_steps, lr, num_samples, rng):
     """ADVI with AutoMultivariateNormal — paper's variational baseline.
 
@@ -572,7 +569,7 @@ def advi_inference(decoder, y_obs_norm, y_mean, y_std,
     sigma_fixed = noise_std / y_std   # fixed: known generative noise, normalised
 
     def model():
-        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D, ig_params)
+        weights, means, vars_, cond = _sm_hyperparameter_priors(Q, D, ig_params, means_scale)
         z = numpyro.sample("z",
                 dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f = decoder(z[None], cond, s=s_all).squeeze()
@@ -819,7 +816,7 @@ def load_latest_checkpoint(ckpt_dir, model, optimizer, loader):
 # =============================================================================
 
 def run_single_config(args, s_all, decoder, config_name, sm_config,
-                      out_dir, num_chains, ig_params, rng):
+                      out_dir, num_chains, ig_params, means_scale, rng):
     log.info(f"\n--- SM config: {config_name} ({sm_config['label']}) ---")
     rng, rng_data, rng_drv, rng_egp, rng_advi = random.split(rng, 5)
 
@@ -846,7 +843,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
     drv_mean, drv_std, drv_samples, drv_extra, drv_time = deeprv_nuts_inference(
         decoder, y_obs_norm, y_mean, y_std,
         s_all, obs_idx, tst_idx,
-        args.q, ig_params, args.noise_std,
+        args.q, ig_params, means_scale, args.noise_std,
         args.num_warmup, args.num_samples, num_chains, rng_drv,
         partial_dense_mass=args.partial_dense_mass,
     )
@@ -875,7 +872,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         egp_mean, egp_std, egp_samples, egp_extra, egp_time = exact_gp_nuts_inference(
             y_obs_norm, y_mean, y_std,
             s_all, obs_idx, tst_idx,
-            args.q, ig_params, args.noise_std,
+            args.q, ig_params, means_scale, args.noise_std,
             args.num_warmup, args.num_samples, num_chains, rng_egp,
             partial_dense_mass=args.partial_dense_mass,
         )
@@ -903,7 +900,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         log.info(f"Running ADVI ({args.advi_steps} steps, lr={args.advi_lr}) …")
         advi_mean, advi_std, advi_samples, advi_time, advi_losses = advi_inference(
             decoder, y_obs_norm, y_mean, y_std,
-            s_all, obs_idx, tst_idx, args.q, ig_params, args.noise_std,
+            s_all, obs_idx, tst_idx, args.q, ig_params, means_scale, args.noise_std,
             args.advi_steps, args.advi_lr, args.advi_samples, rng_advi,
         )
         for name, arr in [("advi_mean",   advi_mean),
@@ -991,29 +988,41 @@ def main():
         [{"start": 0.0, "stop": 1.0, "num": args.grid_size}] * 2
     ).reshape(-1, 2)
 
-    if args.uninformative_prior:
-        ig_params = [(2.0, 1.0)] * s_all.shape[1]
-        log.info("Using uninformative IG(2,1) prior on lengthscales "
-                 "(--uninformative_prior)")
-    else:
-        ig_params = calibrated_ig_params(s_all)
-        log.info(
-            "Calibrated IG lengthscale prior: "
-            + "  ".join(f"d{d}: IG({a:.2f}, {b:.4f})"
-                        for d, (a, b) in enumerate(ig_params))
-        )
-        # Sanity check: verify tail probabilities
-        s_np = np.array(s_all)
-        for d, (a, b) in enumerate(ig_params):
-            dists = spd.pdist(s_np[:, d:d+1])
-            dists = dists[dists > 0]
-            p_lo = float(invgamma.cdf(float(np.min(dists)), a=a, scale=b))
-            p_hi = float(1 - invgamma.cdf(float(np.max(dists)), a=a, scale=b))
-            log.info(f"  IG prior dim {d}: "
-                     f"P(ell<ell_lo)={p_lo:.3f}, "
-                     f"P(ell>ell_hi)={p_hi:.3f} (target both ~0.1)")
+    # Compute calibrated IG prior on ell from grid geometry
+    ig_params = calibrated_ig_params(s_all)
+    log.info(
+        "Calibrated IG lengthscale prior: "
+        + "  ".join(f"d{d}: IG({a:.3f}, {b:.5f})"
+                    for d, (a, b) in enumerate(ig_params))
+    )
+    s_np    = np.array(s_all)
+    dists   = spd.pdist(s_np[:, :1])
+    delta   = float(np.min(dists[dists > 0]))
+    means_scale = delta  # one cycle per minimum grid spacing
 
     loader = sm_dataloader(s_all, args.q, ig_params, BATCH_SIZE)
+
+    # TEMPORARY DEBUG — remove after checking
+    import sys as _sys
+    _s_np = np.array(s_all)
+    _dists = spd.pdist(_s_np[:, :1])
+    _dists = _dists[_dists > 0]
+    _delta_min = float(np.min(_dists))
+    _delta_max = float(np.max(_dists))
+    print(f"delta_min={_delta_min:.5f}  delta_max={_delta_max:.5f}")
+    print(f"v_floor={0.05 / _delta_min**2:.4f}")
+    print(f"ig_params: {ig_params}")
+    _rng_d = random.key(0)
+    _batch_d = next(loader(_rng_d))
+    _c = _batch_d["conditionals"]
+    _log_vars = _c[9:]
+    _vars = jnp.exp(_log_vars)
+    print(f"vars_ range: {float(_vars.min()):.6f} to {float(_vars.max()):.6f}")
+    print(f"v*delta_min^2: {float(_vars.min())*_delta_min**2:.6f} to {float(_vars.max())*_delta_min**2:.6f}")
+    print(f"v*delta_max^2: {float(_vars.min())*_delta_max**2:.4f} to {float(_vars.max())*_delta_max**2:.4f}")
+    print(f"f std: {float(jnp.std(_batch_d['f'])):.4f}")
+    _sys.exit(0)
+    # END TEMPORARY DEBUG
 
     # --- Train ---
     log.info("\n=== Training SM-DeepRV ===")
@@ -1096,7 +1105,7 @@ def main():
         rng_exp, rng_cfg = random.split(rng_exp)
         row = run_single_config(
             args, s_all, decoder, config_name, sm_config,
-            out_dir, num_chains, ig_params, rng_cfg,
+            out_dir, num_chains, ig_params, means_scale, rng_cfg,
         )
         all_rows.append(row)
 
