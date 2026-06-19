@@ -102,21 +102,21 @@ JITTER        = 5e-4
 # variances: /1000 relative to [0,1] values
 SM_CONFIGS = {
     "slow": {
-        "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.005, 0.004], [0.010, 0.008], [0.015, 0.012]],
-        "variances": [[2e-3, 2e-3],   [3e-3, 2.5e-3], [4e-3, 3e-3]],
+        "weights":   [1.0],
+        "means":     [[0.003, 0.002]],
+        "variances": [[8e-5, 8e-5]],
         "label":     "SM slow (low-frequency)",
     },
     "medium": {
-        "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.010, 0.008], [0.025, 0.015], [0.040, 0.030]],
-        "variances": [[4e-3, 3e-3],   [6e-3, 5e-3],   [8e-3, 6e-3]],
+        "weights":   [1.0],
+        "means":     [[0.010, 0.008]],
+        "variances": [[3e-4, 3e-4]],
         "label":     "SM medium (mid-frequency)",
     },
     "fast": {
-        "weights":   [0.5, 0.3, 0.2],
-        "means":     [[0.020, 0.015], [0.050, 0.035], [0.080, 0.060]],
-        "variances": [[6e-3, 5e-3],   [8e-3, 6e-3],   [1.2e-2, 1e-2]],
+        "weights":   [1.0],
+        "means":     [[0.020, 0.015]],
+        "variances": [[1e-3, 8e-4]],
         "label":     "SM fast (high-frequency)",
     },
 }
@@ -133,10 +133,6 @@ def parse_args():
     p.add_argument("--grid_size",   type=int,   default=16)
     p.add_argument("--sm_config",   type=str,   default=None,
                    choices=["slow", "medium", "fast"])
-    p.add_argument("--q",           type=int,   default=3,
-                   help="Number of SM mixture components")
-    p.add_argument("--num_blks",    type=int,   default=2,
-                   help="gMLP blocks (paper default: 2)")
     p.add_argument("--embed_dim",   type=int,   default=64,
                    help="Embedding dim (paper default: 64)")
     # Training
@@ -159,6 +155,10 @@ def parse_args():
     p.add_argument("--partial_dense_mass", action="store_true",
                    help="Dense mass only for hyperparameters, not z "
                         "(faster warmup than full dense_mass=True)")
+    p.add_argument("--no_dense_mass", action="store_true",
+                   help="Diagonal mass matrix only — matches the paper's "
+                        "NUTS setup (no dense_mass). Overrides "
+                        "--partial_dense_mass if both are passed.")
     # ADVI
     p.add_argument("--advi",        action="store_true",
                    help="Also run ADVI as a third method")
@@ -170,9 +170,12 @@ def parse_args():
                    help="Skip exact GP baseline")
     # Masking
     p.add_argument("--mask_type",     type=str,   default="contiguous",
-                   choices=["contiguous", "random"],
-                   help="Masking strategy: contiguous (harder extrapolation, "
-                        "paper default) or random (realistic TROPOMI missingness)")
+                   choices=["contiguous", "random", "blob"],
+                   help="Masking strategy: contiguous (single rectangular "
+                        "gap, harder extrapolation), random (uniform i.i.d., "
+                        "realistic TROPOMI missingness), or blob (scattered "
+                        "ellipses, direct port of the paper's "
+                        "gen_spatial_obs_mask)")
     p.add_argument("--mask_fraction", type=float, default=0.5,
                    help="Fraction of grid to mask (default: 0.5). "
                         "Only applies to contiguous masking — controls block size. "
@@ -365,6 +368,65 @@ def random_mask(grid_size, rng_key=None):
     return obs_idx, tst_idx
 
 
+def blob_mask(grid_size, mask_fraction=0.5, rng_key=None):
+    """Multiple scattered elliptical blobs — direct port of the paper's
+    gen_spatial_obs_mask (Navott et al., spatiotemporal kernel section).
+
+    Builds up OBSERVED coverage by accumulating randomly placed/sized
+    ellipses until obs_ratio of the grid is covered, then (if it overshot)
+    trims back down to exactly obs_ratio. Unlike contiguous_mask (one single
+    rectangular gap) this scatters several smaller gaps across the grid,
+    so no individual hole is much larger than one blob's diameter.
+
+    Args:
+        grid_size:     number of grid points per side (H == W == grid_size)
+        mask_fraction: fraction of grid to HOLD OUT (i.e. 1 - obs_ratio).
+                       Matches contiguous_mask's convention so the two are
+                       directly comparable at the same missingness level.
+        rng_key:       JAX random key for reproducible blob placement
+    """
+    H = W       = grid_size
+    obs_ratio   = 1.0 - mask_fraction
+    total_points= H * W
+    num_obs     = int(obs_ratio * total_points)
+
+    seed   = int(jax.random.bits(rng_key)) if rng_key is not None else 0
+    rng_np = np.random.default_rng(seed)
+
+    mask = np.zeros((H, W), dtype=bool)   # True = observed (paper's convention)
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+
+    points_collected = 0
+    n_blobs = 0
+    while points_collected < num_obs:
+        center_x = rng_np.integers(0, H)
+        center_y = rng_np.integers(0, W)
+        radius_x = rng_np.integers(H // 8, H // 4 + 1)
+        radius_y = rng_np.integers(W // 8, W // 4 + 1)
+
+        ellipse  = (((xx - center_x) / radius_x) ** 2 +
+                    ((yy - center_y) / radius_y) ** 2) <= 1.0
+        new_mask = np.logical_or(mask, ellipse)
+        points_collected += int(new_mask.sum() - mask.sum())
+        mask = new_mask
+        n_blobs += 1
+
+    if points_collected > num_obs:
+        flat_idxs = np.flatnonzero(mask.ravel())
+        selected  = rng_np.choice(flat_idxs, size=num_obs, replace=False)
+        final_mask = np.zeros(total_points, dtype=bool)
+        final_mask[selected] = True
+    else:
+        final_mask = mask.ravel()
+
+    obs_idx = jnp.array(np.sort(np.where(final_mask)[0]))
+    tst_idx = jnp.array(np.sort(np.where(~final_mask)[0]))
+    log.info(f"Blob mask: {n_blobs} ellipse(s) — "
+             f"{len(tst_idx)}/{total_points} held out "
+             f"({100*len(tst_idx)/total_points:.1f}%)")
+    return obs_idx, tst_idx
+
+
 # =============================================================================
 # Data generation
 # =============================================================================
@@ -391,6 +453,10 @@ def generate_observations(s_all, grid_size, sm_config, noise_std, rng,
         obs_idx, tst_idx = contiguous_mask(grid_size,
                                            mask_fraction=mask_fraction,
                                            rng_key=rng_mask)
+    elif mask_type == "blob":
+        obs_idx, tst_idx = blob_mask(grid_size,
+                                     mask_fraction=mask_fraction,
+                                     rng_key=rng_mask)
     else:
         obs_idx, tst_idx = random_mask(grid_size, rng_key=rng_mask)
 
@@ -519,6 +585,9 @@ def _sm_hyperparameter_priors(Q, D, fixed_weights=None):
     if fixed_weights is not None:
         weights = fixed_weights
         numpyro.deterministic("weights", weights)
+    elif Q == 1:
+        weights = jnp.array([1.0])
+        numpyro.deterministic("weights", weights)
     else:
         raw     = numpyro.sample("raw_w", dist.Gamma(jnp.ones(Q), jnp.ones(Q)))
         weights = raw / raw.sum()
@@ -553,6 +622,7 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
                           Q, noise_std,
                           num_warmup, num_samples, num_chains, rng,
                           partial_dense_mass=False,
+                          no_dense_mass=False,
                           likelihood="gaussian", studentt_df=7.0,
                           fixed_weights=None):
     """NUTS over (z, θ) using the surrogate decoder.
@@ -577,8 +647,12 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
                  likelihood, studentt_df)
         numpyro.deterministic("f_all", f)
 
-    dense_mass = ([["means", "variances"]]
-                  if partial_dense_mass else True)
+    if no_dense_mass:
+        dense_mass = False
+    elif partial_dense_mass:
+        dense_mass = [["means", "variances"]]
+    else:
+        dense_mass = True
     t0      = time.time()
     mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=dense_mass, init_strategy=init_to_median(num_samples=10)),
                    num_warmup=num_warmup, num_samples=num_samples,
@@ -605,6 +679,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                              Q, noise_std,
                              num_warmup, num_samples, num_chains, rng,
                              partial_dense_mass=False,
+                             no_dense_mass=False,
                              likelihood="gaussian", studentt_df=7.0,
                              fixed_weights=None):
     """NUTS over (z, θ) using the exact SM Cholesky — centred parameterisation.
@@ -633,8 +708,12 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                  likelihood, studentt_df)
         numpyro.deterministic("f_all", f)
 
-    dense_mass = ([["means", "variances"]]
-                  if partial_dense_mass else True)
+    if no_dense_mass:
+        dense_mass = False
+    elif partial_dense_mass:
+        dense_mass = [["means", "variances"]]
+    else:
+        dense_mass = True
     t0      = time.time()
     mcmc    = MCMC(NUTS(model, target_accept_prob=0.8, dense_mass=dense_mass, init_strategy=init_to_median(num_samples=10)),
                    num_warmup=num_warmup, num_samples=num_samples,
@@ -941,25 +1020,30 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         np.save(cfg_dir / f"{name}.npy", np.array(arr))
     np.save(cfg_dir / "y_scale.npy", np.array([y_mean, y_std]))
 
-    # --- Optimise weights via expected marginal likelihood ---
+    # --- Optimise weights via expected marginal likelihood (skip for Q=1) ---
     rng, rng_wopt = random.split(rng)
-    log.info("Optimising SM mixture weights via expected marginal likelihood…")
-    fixed_weights = optimise_weights(
-        y_obs_norm, s_all, obs_idx, args.q,
-        args.noise_std, y_std,
-        n_steps=500, n_mc=8, lr=1e-2, rng=rng_wopt,
-    )
+    if 1 == 1:
+        fixed_weights = jnp.array([1.0])
+        log.info("Q=1: weight fixed to 1.0, skipping optimisation.")
+    else:
+        log.info("Optimising SM mixture weights via expected marginal likelihood…")
+        fixed_weights = optimise_weights(
+            y_obs_norm, s_all, obs_idx, 1,
+            args.noise_std, y_std,
+            n_steps=500, n_mc=8, lr=1e-2, rng=rng_wopt,
+        )
+        log.info(f"Fixed weights: {[f'{float(w):.4f}' for w in fixed_weights]}")
     np.save(cfg_dir / "fixed_weights.npy", np.array(fixed_weights))
-    log.info(f"Fixed weights: {[f'{float(w):.4f}' for w in fixed_weights]}")
 
     # --- SM-DeepRV NUTS ---
     log.info(f"Running SM-DeepRV NUTS ({num_chains} chain(s)) …")
     drv_mean, drv_std, drv_samples, drv_extra, drv_time = deeprv_nuts_inference(
         decoder, y_obs_norm, y_mean, y_std,
         s_all, obs_idx, tst_idx,
-        args.q, args.noise_std,
+        1, args.noise_std,
         args.num_warmup, args.num_samples, num_chains, rng_drv,
         partial_dense_mass=args.partial_dense_mass,
+        no_dense_mass=args.no_dense_mass,
         likelihood=args.likelihood, studentt_df=args.studentt_df,
         fixed_weights=fixed_weights,
     )
@@ -988,9 +1072,10 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         egp_mean, egp_std, egp_samples, egp_extra, egp_time = exact_gp_nuts_inference(
             y_obs_norm, y_mean, y_std,
             s_all, obs_idx, tst_idx,
-            args.q, args.noise_std,
+            1, args.noise_std,
             args.num_warmup, args.num_samples, num_chains, rng_egp,
             partial_dense_mass=args.partial_dense_mass,
+        no_dense_mass=args.no_dense_mass,
             likelihood=args.likelihood, studentt_df=args.studentt_df,
             fixed_weights=fixed_weights,
         )
@@ -1018,7 +1103,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         log.info(f"Running ADVI ({args.advi_steps} steps, lr={args.advi_lr}) …")
         advi_mean, advi_std, advi_samples, advi_time, advi_losses = advi_inference(
             decoder, y_obs_norm, y_mean, y_std,
-            s_all, obs_idx, tst_idx, args.q, args.noise_std,
+            s_all, obs_idx, tst_idx, 1, args.noise_std,
             args.advi_steps, args.advi_lr, args.advi_samples, rng_advi,
         )
         for name, arr in [("advi_mean",   advi_mean),
@@ -1041,7 +1126,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                             cfg_dir, config_name)
     plot_posterior_hyperparams(drv_samples,
                                egp_samples if egp_samples else None,
-                               args.q, sm_config, cfg_dir, config_name)
+                               1, sm_config, cfg_dir, config_name)
     plot_scatter_pred_vs_true(drv_mean, egp_mean, advi_mean, f_test,
                               sm_config["label"], cfg_dir, config_name)
 
@@ -1078,8 +1163,8 @@ def main():
 
     ckpt_dir  = (args.load_ckpt or args.ckpt_dir or str(
         Path(args.results_dir) /
-        f"sim_checkpoints_grid{args.grid_size}_q{args.q}"
-        f"_blks{args.num_blks}_emb{args.embed_dim}"
+        f"sim_checkpoints_grid{args.grid_size}_q{1}"
+        f"_blks{2}_emb{args.embed_dim}"
     ))
 
     if args.fresh_run and Path(ckpt_dir).exists():
@@ -1089,7 +1174,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=== SM-DeepRV Simulation ===")
-    log.info(f"Grid: {args.grid_size}²  Q={args.q}  "
+    log.info(f"Grid: {args.grid_size}²  Q={1}  "
              f"Steps={train_steps}  LR={lr}")
     log.info(f"NUTS: {args.num_warmup} warmup / {args.num_samples} samples / "
              f"{num_chains} chain(s)")
@@ -1106,7 +1191,7 @@ def main():
         [{"start": 0.0, "stop": 100.0, "num": args.grid_size}] * 2
     ).reshape(-1, 2)
 
-    loader = sm_dataloader(s_all, args.q, BATCH_SIZE)
+    loader = sm_dataloader(s_all, 1, BATCH_SIZE)
 
     # --- Train ---
     log.info("\n=== Training SM-DeepRV ===")
@@ -1114,7 +1199,7 @@ def main():
     wandb.init(project="sm_deeprv", entity="emrys-king25-imperial-college-london",
                name=run_name, config={
         "grid_size": args.grid_size, "train_steps": train_steps,
-        "lr": lr, "Q": args.q, "num_blks": args.num_blks,
+        "lr": lr, "Q": 1, "num_blks": 2,
         "embed_dim": args.embed_dim, "kernel": "spectral_mixture",
         "likelihood": "gaussian", "noise_std": args.noise_std,
     })
@@ -1122,11 +1207,11 @@ def main():
     wandb.define_metric("Valid norm MSE", step_metric="_step")
 
     nn_model  = gMLPDeepRV(
-        num_blks = args.num_blks,
+        num_blks = 2,
         embed    = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
         proj_out = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
     )
-    log.info(f"Architecture: gMLPDeepRV(num_blks={args.num_blks}, "
+    log.info(f"Architecture: gMLPDeepRV(num_blks={2}, "
              f"embed_dim={args.embed_dim})")
     optimizer = optax.chain(
         optax.clip_by_global_norm(3.0),
