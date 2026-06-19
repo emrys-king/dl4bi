@@ -10,3 +10,4 @@ sm_kernels/data/
 uv.lock
 sm_kernel_env
 prior_geometry.pdf
+run_sim_pipeline.sh

@@ -1,38 +1,45 @@
 """
-SM-DeepRV BASIC INFERENCE Experiment
-=====================================
-Companion script to simulation.py, focused on hyperparameter recovery
-rather than spatial prediction/extrapolation. Given NEAR-COMPLETE
-observation of the field (default: 95% observed, 5% held out for a
-sanity-check RMSE), this checks whether the posterior over SM kernel
-hyperparameters (means, variances) concentrates around the values used
-to generate the data — the task classical GPs are most directly suited
-to, as opposed to interpolation/extrapolation under heavy masking.
+SM-DeepRV Simulation Experiment
+================================
+Evaluates SM-DeepRV using the same experimental structure as the DeepRV paper
+(Section 6.1 / Appendix B.1), extended to a Spectral Mixture kernel and a
+Gaussian likelihood appropriate for continuous air quality measurements.
 
-Compares the same two methods as simulation.py:
+Compares three methods:
   1. SM-DeepRV (NUTS) — surrogate-accelerated inference (this work)
-  2. Exact SM-GP (NUTS) — full O(N³) GP inference, same (z, θ, σ) space
+  2. Exact SM-GP (NUTS) — full O(N³) GP inference sampling z explicitly,
+                           matching DeepRV's (z, θ, σ) inference space for
+                           a fair timing comparison (decoder vs Cholesky)
+  3. ADVI              — variational inference baseline (optional, --advi)
 
-Primary output: per-parameter posterior mean, true value, absolute/
-relative error, and 95% CI coverage for each SM hyperparameter — see
-evaluate_hyperparam_recovery() and the saved *_hyperparam_recovery.csv
-files. Spatial RMSE/coverage on the small held-out set are still
-reported for completeness but are NOT the focus here.
+Fair timing comparison:
+  Both SM-DeepRV and Exact GP sample the same variables:
+    z ~ N(0, I)  [N_all dimensions],  θ (SM hyperparameters),  σ
+  The only difference per NUTS step is:
+    SM-DeepRV : O(N²) decoder forward pass
+    Exact GP  : O(N³) Cholesky decomposition
+  This matches the paper's setup and makes the timing comparison meaningful.
 
 Usage
 -----
-    # Train then run basic-inference for all configs (dense masking default)
-    CUDA_VISIBLE_DEVICES=0 python inference_basic.py --grid_size 16
+    # Full run — all three SM configurations
+    CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 16 \\
+        --num_blks 2 --embed_dim 64
 
-    # Load a trained checkpoint (shared with simulation.py — same Q=1
-    # architecture, so checkpoints are interchangeable)
-    CUDA_VISIBLE_DEVICES=0 python inference_basic.py --grid_size 16 \\
-        --load_ckpt results/sim_checkpoints_grid16_q1_blks2_emb64
+    # Load a trained checkpoint, skip to inference
+    CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 16 \\
+        --num_blks 2 --embed_dim 64 \\
+        --load_ckpt results/sim_checkpoints_grid16_q3_blks2_emb64
 
-    # Single config, custom held-out fraction
-    CUDA_VISIBLE_DEVICES=0 python inference_basic.py --grid_size 16 \\
-        --load_ckpt results/sim_checkpoints_grid16_q1_blks2_emb64 \\
-        --sm_config medium --mask_fraction 0.02
+    # Quick sanity check
+    CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 8 --sm_config medium \\
+        --train_steps 5000 --num_warmup 100 --num_samples 200
+
+    # Skip exact GP baseline (faster development)
+    CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 16 --no_exact_gp
+
+    # Include ADVI
+    CUDA_VISIBLE_DEVICES=0 python simulation.py --grid_size 16 --advi
 """
 
 # =============================================================================
@@ -51,7 +58,7 @@ import jax.numpy as jnp
 from jax import jit, vmap, random
 import scipy.spatial.distance as spd
 from scipy.optimize import root
-from scipy.stats import invgamma, gaussian_kde
+from scipy.stats import invgamma
 
 import numpyro
 import numpyro.distributions as dist
@@ -128,6 +135,8 @@ def parse_args():
                    choices=["slow", "medium", "fast"])
     p.add_argument("--embed_dim",   type=int,   default=64,
                    help="Embedding dim (paper default: 64)")
+    p.add_argument("--q",           type=int,   default=1,
+                   help="Number of SM mixture components (default: 1)")
     # Training
     p.add_argument("--train_steps", type=int,   default=None)
     p.add_argument("--lr",          type=float, default=None)
@@ -162,19 +171,17 @@ def parse_args():
     p.add_argument("--no_exact_gp", action="store_true",
                    help="Skip exact GP baseline")
     # Masking
-    p.add_argument("--mask_type",     type=str,   default="dense",
-                   choices=["dense", "contiguous", "random", "blob"],
-                   help="Masking strategy. This script defaults to 'dense' "
-                        "(near-complete observation, ~95%% by default) since "
-                        "it targets BASIC INFERENCE — hyperparameter recovery "
-                        "given plentiful data — rather than spatial "
-                        "prediction/extrapolation quality. The other mask "
-                        "types are retained for direct comparability with "
-                        "the main prediction-task script.")
-    p.add_argument("--mask_fraction", type=float, default=0.05,
-                   help="Fraction of grid to HOLD OUT (default: 0.05 = 5%%, "
-                        "appropriate for 'dense' masking). For contiguous/blob "
-                        "this controls gap size as in the main script.")
+    p.add_argument("--mask_type",     type=str,   default="contiguous",
+                   choices=["contiguous", "random", "blob"],
+                   help="Masking strategy: contiguous (single rectangular "
+                        "gap, harder extrapolation), random (uniform i.i.d., "
+                        "realistic TROPOMI missingness), or blob (scattered "
+                        "ellipses, direct port of the paper's "
+                        "gen_spatial_obs_mask)")
+    p.add_argument("--mask_fraction", type=float, default=0.5,
+                   help="Fraction of grid to mask (default: 0.5). "
+                        "Only applies to contiguous masking — controls block size. "
+                        "E.g. 0.25 masks a smaller block, 0.5 masks ~half the grid.")
     # Misc
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--results_dir", type=str,   default="results")
@@ -193,7 +200,7 @@ def parse_args():
 def paper_train_steps(grid_size, override=None):
     if override is not None:
         return override
-    return 500_000 if grid_size < 32 else 1_000_000
+    return 500_000 if grid_size <= 32 else 700_000
 
 
 def paper_lr(grid_size, override=None):
@@ -204,7 +211,7 @@ def paper_lr(grid_size, override=None):
 
 def paper_num_chains():
     """Single chain — limited to one GPU."""
-    return 2
+    return 1
 
 
 # =============================================================================
@@ -363,26 +370,6 @@ def random_mask(grid_size, rng_key=None):
     return obs_idx, tst_idx
 
 
-def dense_mask(grid_size, mask_fraction=0.05, rng_key=None):
-    """Near-complete observation: hold out only a small i.i.d. fraction
-    (default 5%) scattered across the grid, purely so RMSE/coverage can
-    still be computed on a few unseen points. The other ~95% inform the
-    hyperparameter posterior directly — this is the 'basic inference'
-    regime: can the kernel hyperparameters be recovered when data is
-    plentiful, as opposed to the prediction/extrapolation regimes which
-    stress-test held-out spatial generalisation.
-    """
-    N       = grid_size ** 2
-    n_test  = max(1, int(N * mask_fraction))
-    seed    = int(jax.random.bits(rng_key)) if rng_key is not None else 0
-    perm    = np.random.default_rng(seed).permutation(N)
-    tst_idx = jnp.array(np.sort(perm[:n_test]))
-    obs_idx = jnp.array(np.sort(perm[n_test:]))
-    log.info(f"Dense mask: {len(tst_idx)}/{N} held out "
-             f"({100*len(tst_idx)/N:.1f}%) — basic inference regime")
-    return obs_idx, tst_idx
-
-
 def blob_mask(grid_size, mask_fraction=0.5, rng_key=None):
     """Multiple scattered elliptical blobs — direct port of the paper's
     gen_spatial_obs_mask (Navott et al., spatiotemporal kernel section).
@@ -464,11 +451,7 @@ def generate_observations(s_all, grid_size, sm_config, noise_std, rng,
     if jnp.any(jnp.isnan(f_all)):
         raise ValueError("f_all contains NaN — kernel near-singular.")
 
-    if mask_type == "dense":
-        obs_idx, tst_idx = dense_mask(grid_size,
-                                      mask_fraction=mask_fraction,
-                                      rng_key=rng_mask)
-    elif mask_type == "contiguous":
+    if mask_type == "contiguous":
         obs_idx, tst_idx = contiguous_mask(grid_size,
                                            mask_fraction=mask_fraction,
                                            rng_key=rng_mask)
@@ -809,45 +792,6 @@ def evaluate(mean_pred, std_pred, f_true):
             "Coverage_95": coverage, "Mean_std": mean_std}
 
 
-def evaluate_hyperparam_recovery(samples, sm_config, Q, D):
-    """Posterior recovery of the true SM kernel hyperparameters.
-
-    This is the primary metric for the basic-inference regime: with
-    near-complete observation, does the posterior over (means, variances)
-    concentrate around the values used to generate the data? Reports, per
-    parameter, the posterior mean, the true value, absolute error of the
-    posterior mean, and whether the true value falls within the 95% CI
-    (analogous to coverage, but for hyperparameters rather than f).
-    """
-    true_means = np.array(sm_config["means"])     # (Q, D)
-    true_vars  = np.array(sm_config["variances"])  # (Q, D)
-
-    post_means = np.array(samples["means"])        # (S, Q, D)
-    post_vars  = np.array(samples["variances"])     # (S, Q, D)
-
-    rows = []
-    for q in range(Q):
-        for d in range(D):
-            for name, post, true in [
-                ("means",     post_means, true_means),
-                ("variances", post_vars,  true_vars),
-            ]:
-                draws    = post[:, q, d]
-                est_mean = float(np.mean(draws))
-                true_val = float(true[q, d])
-                lo, hi   = np.percentile(draws, [2.5, 97.5])
-                rows.append({
-                    "param": f"{name}[{q},{d}]",
-                    "true": true_val,
-                    "post_mean": est_mean,
-                    "abs_error": abs(est_mean - true_val),
-                    "rel_error": abs(est_mean - true_val) / (abs(true_val) + 1e-8),
-                    "ci_lo": float(lo), "ci_hi": float(hi),
-                    "covered": bool(lo <= true_val <= hi),
-                })
-    return pd.DataFrame(rows)
-
-
 # =============================================================================
 # Plots
 # =============================================================================
@@ -983,78 +927,6 @@ def plot_posterior_hyperparams(drv_samples, egp_samples, Q,
     log.info(f"Hyperparams plot → {path}")
 
 
-def plot_hyperparam_kde(drv_samples, egp_samples, sm_config, Q, D,
-                        out_dir, tag):
-    """KDE of the posterior for each (means, variances) entry — one panel
-    per parameter, true value marked with a vertical dashed line. This is
-    the primary diagnostic for the basic-inference regime: with
-    near-complete observation, the posterior should concentrate tightly
-    around the true value.
-    """
-    true_means = np.array(sm_config["means"])      # (Q, D)
-    true_vars  = np.array(sm_config["variances"])   # (Q, D)
-    n_params   = 2 * Q * D   # means + variances, each Q×D
-    n_cols     = 2 * D
-    n_rows     = Q
-
-    fig, axes = plt.subplots(n_rows, n_cols,
-                             figsize=(4 * n_cols, 3.2 * n_rows),
-                             squeeze=False)
-    colours = {"SM-DeepRV": "#2196F3", "Exact GP": "#FF5722"}
-
-    for q in range(Q):
-        for d in range(D):
-            for j, (name, post_all, true_all) in enumerate([
-                ("means",     None, true_means),
-                ("variances", None, true_vars),
-            ]):
-                ax = axes[q][d + j * D]
-                true_val = float(true_all[q, d])
-
-                series = [("SM-DeepRV", drv_samples)]
-                if egp_samples is not None:
-                    series.append(("Exact GP", egp_samples))
-
-                all_draws = []
-                for label, samp in series:
-                    draws = np.array(samp[name])[:, q, d]
-                    all_draws.append(draws)
-
-                lo = min(d.min() for d in all_draws + [np.array([true_val])])
-                hi = max(d.max() for d in all_draws + [np.array([true_val])])
-                pad = 0.1 * (hi - lo + 1e-8)
-                xs  = np.linspace(lo - pad, hi + pad, 400)
-
-                for (label, _), draws in zip(series, all_draws):
-                    try:
-                        kde = gaussian_kde(draws)
-                        ax.plot(xs, kde(xs), color=colours[label],
-                               linewidth=1.6, label=label)
-                        ax.fill_between(xs, kde(xs), alpha=0.15,
-                                        color=colours[label])
-                    except np.linalg.LinAlgError:
-                        # degenerate (near-zero variance) draws
-                        ax.axvline(float(np.mean(draws)),
-                                  color=colours[label], linewidth=1.6,
-                                  label=label)
-
-                ax.axvline(true_val, color="k", linestyle="--",
-                          linewidth=1.5, label=f"True={true_val:.4g}")
-                ax.set_title(f"{name}[{q},{d}]", fontsize=10)
-                ax.set_xlabel("Value", fontsize=8)
-                ax.set_ylabel("Density", fontsize=8)
-                ax.tick_params(labelsize=7)
-                ax.legend(fontsize=7)
-
-    plt.suptitle(f"Posterior KDE — SM hyperparameters ({sm_config['label']})",
-                fontsize=12)
-    plt.tight_layout()
-    path = Path(out_dir) / f"hyperparam_kde_{tag}.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    log.info(f"Hyperparameter KDE plot → {path}")
-
-
 def plot_scatter_pred_vs_true(drv_mean, egp_mean, advi_mean, f_test,
                                config_label, out_dir, tag):
     active = [(n, m, c) for n, m, c in [
@@ -1152,13 +1024,13 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
 
     # --- Optimise weights via expected marginal likelihood (skip for Q=1) ---
     rng, rng_wopt = random.split(rng)
-    if 1 == 1:
+    if args.q == 1:
         fixed_weights = jnp.array([1.0])
         log.info("Q=1: weight fixed to 1.0, skipping optimisation.")
     else:
         log.info("Optimising SM mixture weights via expected marginal likelihood…")
         fixed_weights = optimise_weights(
-            y_obs_norm, s_all, obs_idx, 1,
+            y_obs_norm, s_all, obs_idx, args.q,
             args.noise_std, y_std,
             n_steps=500, n_mc=8, lr=1e-2, rng=rng_wopt,
         )
@@ -1170,7 +1042,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
     drv_mean, drv_std, drv_samples, drv_extra, drv_time = deeprv_nuts_inference(
         decoder, y_obs_norm, y_mean, y_std,
         s_all, obs_idx, tst_idx,
-        1, args.noise_std,
+        args.q, args.noise_std,
         args.num_warmup, args.num_samples, num_chains, rng_drv,
         partial_dense_mass=args.partial_dense_mass,
         no_dense_mass=args.no_dense_mass,
@@ -1194,11 +1066,6 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
              f"Coverage={drv_metrics['Coverage_95']:.3f}  "
              f"Time={drv_time:.1f}s")
 
-    drv_hparam = evaluate_hyperparam_recovery(drv_samples, sm_config, 1, s_all.shape[1])
-    drv_hparam.to_csv(cfg_dir / "drv_hyperparam_recovery.csv", index=False)
-    log.info("SM-DeepRV hyperparameter recovery:\n" +
-             drv_hparam.to_string(index=False))
-
     # --- Exact GP NUTS ---
     egp_mean = egp_std = egp_samples = egp_time = None
     egp_metrics = {}
@@ -1207,7 +1074,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         egp_mean, egp_std, egp_samples, egp_extra, egp_time = exact_gp_nuts_inference(
             y_obs_norm, y_mean, y_std,
             s_all, obs_idx, tst_idx,
-            1, args.noise_std,
+            args.q, args.noise_std,
             args.num_warmup, args.num_samples, num_chains, rng_egp,
             partial_dense_mass=args.partial_dense_mass,
         no_dense_mass=args.no_dense_mass,
@@ -1231,11 +1098,6 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                  f"Coverage={egp_metrics['Coverage_95']:.3f}  "
                  f"Time={egp_time:.1f}s")
 
-        egp_hparam = evaluate_hyperparam_recovery(egp_samples, sm_config, 1, s_all.shape[1])
-        egp_hparam.to_csv(cfg_dir / "egp_hyperparam_recovery.csv", index=False)
-        log.info("Exact GP hyperparameter recovery:\n" +
-                 egp_hparam.to_string(index=False))
-
     # --- ADVI ---
     advi_mean = advi_std = advi_time = None
     advi_metrics = {}
@@ -1243,7 +1105,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         log.info(f"Running ADVI ({args.advi_steps} steps, lr={args.advi_lr}) …")
         advi_mean, advi_std, advi_samples, advi_time, advi_losses = advi_inference(
             decoder, y_obs_norm, y_mean, y_std,
-            s_all, obs_idx, tst_idx, 1, args.noise_std,
+            s_all, obs_idx, tst_idx, args.q, args.noise_std,
             args.advi_steps, args.advi_lr, args.advi_samples, rng_advi,
         )
         for name, arr in [("advi_mean",   advi_mean),
@@ -1266,10 +1128,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                             cfg_dir, config_name)
     plot_posterior_hyperparams(drv_samples,
                                egp_samples if egp_samples else None,
-                               1, sm_config, cfg_dir, config_name)
-    plot_hyperparam_kde(drv_samples,
-                        egp_samples if egp_samples else None,
-                        sm_config, 1, s_all.shape[1], cfg_dir, config_name)
+                               args.q, sm_config, cfg_dir, config_name)
     plot_scatter_pred_vs_true(drv_mean, egp_mean, advi_mean, f_test,
                               sm_config["label"], cfg_dir, config_name)
 
@@ -1301,12 +1160,12 @@ def main():
                    if args.sm_config else SM_CONFIGS)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name  = f"inferbasic_{timestamp}_grid{args.grid_size}"
+    run_name  = f"sim_{timestamp}_grid{args.grid_size}"
     out_dir   = Path(args.results_dir) / run_name
 
     ckpt_dir  = (args.load_ckpt or args.ckpt_dir or str(
         Path(args.results_dir) /
-        f"sim_checkpoints_grid{args.grid_size}_q{1}"
+        f"sim_checkpoints_grid{args.grid_size}_q{args.q}"
         f"_blks{2}_emb{args.embed_dim}"
     ))
 
@@ -1317,7 +1176,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=== SM-DeepRV Simulation ===")
-    log.info(f"Grid: {args.grid_size}²  Q={1}  "
+    log.info(f"Grid: {args.grid_size}²  Q={args.q}  "
              f"Steps={train_steps}  LR={lr}")
     log.info(f"NUTS: {args.num_warmup} warmup / {args.num_samples} samples / "
              f"{num_chains} chain(s)")
@@ -1334,7 +1193,7 @@ def main():
         [{"start": 0.0, "stop": 100.0, "num": args.grid_size}] * 2
     ).reshape(-1, 2)
 
-    loader = sm_dataloader(s_all, 1, BATCH_SIZE)
+    loader = sm_dataloader(s_all, args.q, BATCH_SIZE)
 
     # --- Train ---
     log.info("\n=== Training SM-DeepRV ===")
@@ -1342,7 +1201,7 @@ def main():
     wandb.init(project="sm_deeprv", entity="emrys-king25-imperial-college-london",
                name=run_name, config={
         "grid_size": args.grid_size, "train_steps": train_steps,
-        "lr": lr, "Q": 1, "num_blks": 2,
+        "lr": lr, "Q": args.q, "num_blks": 2,
         "embed_dim": args.embed_dim, "kernel": "spectral_mixture",
         "likelihood": "gaussian", "noise_std": args.noise_std,
     })

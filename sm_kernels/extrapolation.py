@@ -214,7 +214,7 @@ def paper_lr(grid_size, override=None):
 
 def paper_num_chains():
     """Single chain — limited to one GPU."""
-    return 1
+    return 2
 
 
 # =============================================================================
