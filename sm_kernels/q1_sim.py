@@ -95,7 +95,7 @@ log = logging.getLogger(__name__)
 
 MASK_FRACTION = 0.5
 BATCH_SIZE    = 32
-JITTER        = 5e-4
+JITTER        = 2e-3
 
 # SM configurations for the [0,100]² grid.
 # means    : /100 relative to [0,1] values
@@ -306,7 +306,8 @@ def sm_dataloader(s, Q, batch_size=BATCH_SIZE):
         raw     = random.gamma(rng_w, a=1.0, shape=(Q,))
         weights = raw / raw.sum()
         means   = jnp.exp(random.normal(rng_mu, shape=(Q, D))) / 100.0
-        vars_   = 1.0 / random.gamma(rng_v, a=2.0, shape=(Q, D)) / 1_000.0
+        ell     = random.uniform(rng_v, shape=(Q, D), minval=1.0, maxval=35.0)
+        vars_   = 1.0 / (2.0 * jnp.pi**2 * ell**2)
         K = spectral_mixture(s, s, weights, means, vars_) + jitter
         L = jnp.linalg.cholesky(K)
         z = random.normal(rng_z, shape=(batch_size, N))
@@ -595,16 +596,15 @@ def _sm_hyperparameter_priors(Q, D, fixed_weights=None):
 
     means = numpyro.sample(
         "means",
-        dist.LogNormal(jnp.zeros((Q, D)), jnp.ones((Q, D)))
-    ) / 100.0
+        dist.Uniform(0.0005 * jnp.ones((Q, D)), 0.03 * jnp.ones((Q, D)))
+    )
 
-    vars_ = numpyro.sample(
-        "variances",
-        dist.InverseGamma(
-            2.0 * jnp.ones((Q, D)),
-            jnp.ones((Q, D)),
-        )
-    ) / 1_000.0
+    ell = numpyro.sample(
+        "ell",
+        dist.Uniform(1.0 * jnp.ones((Q, D)), 35.0 * jnp.ones((Q, D)))
+    )
+    vars_ = 1.0 / (2.0 * jnp.pi**2 * ell**2)
+    numpyro.deterministic("variances", vars_)
     numpyro.deterministic("vars_det", vars_)
 
     cond = jnp.concatenate([weights,
@@ -659,7 +659,7 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
                    num_chains=num_chains,
                    chain_method="parallel" if num_chains > 1 else "sequential",
                    progress_bar=True)
-    mcmc.run(jax.random.fold_in(rng, 0), extra_fields=("energy", "diverging"))
+    mcmc.run(jax.random.fold_in(rng, 0), extra_fields=("energy", "diverging","accept_prob", "num_steps"))
     elapsed = time.time() - t0
     log.info(f"SM-DeepRV NUTS: {elapsed:.1f}s")
     mcmc.print_summary()
@@ -720,7 +720,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                    num_chains=num_chains,
                    chain_method="parallel" if num_chains > 1 else "sequential",
                    progress_bar=True)
-    mcmc.run(jax.random.fold_in(rng, 1), extra_fields=("energy", "diverging"))
+    mcmc.run(jax.random.fold_in(rng, 1), extra_fields=("energy", "diverging","accept_prob", "num_steps"))
     elapsed = time.time() - t0
     log.info(f"Exact GP NUTS: {elapsed:.1f}s")
     mcmc.print_summary()
@@ -1052,13 +1052,15 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                       ("drv_weights", drv_samples["weights"])]:
         np.save(cfg_dir / f"{name}.npy", np.array(arr))
     for name, arr in drv_samples.items():
-        if name in ("f_all", "z"):
-            continue
         np.save(cfg_dir / f"drv_samples_{name}.npy", np.array(arr))
     if "energy" in drv_extra:
         np.save(cfg_dir / "drv_energy.npy",    np.array(drv_extra["energy"]))
     if "diverging" in drv_extra:
         np.save(cfg_dir / "drv_diverging.npy", np.array(drv_extra["diverging"]))
+    if "accept_prob" in drv_extra:
+        np.save(cfg_dir / "drv_accept_prob.npy", np.array(drv_extra["accept_prob"]))
+    if "num_steps" in drv_extra:
+        np.save(cfg_dir / "drv_num_steps.npy", np.array(drv_extra["num_steps"]))
     drv_metrics = evaluate(drv_mean, drv_std, f_test)
     log.info(f"SM-DeepRV — RMSE={drv_metrics['RMSE']:.4f}  "
              f"Coverage={drv_metrics['Coverage_95']:.3f}  "
@@ -1084,8 +1086,6 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                           ("egp_weights", egp_samples["weights"])]:
             np.save(cfg_dir / f"{name}.npy", np.array(arr))
         for name, arr in egp_samples.items():
-            if name in ("f_all", "z"):
-                continue
             np.save(cfg_dir / f"egp_samples_{name}.npy", np.array(arr))
         if "energy" in egp_extra:
             np.save(cfg_dir / "egp_energy.npy",    np.array(egp_extra["energy"]))
@@ -1241,6 +1241,19 @@ def main():
         valid_interval = args.valid_interval or max(train_steps // 4, 1)
         log.info(f"Validation every {valid_interval} steps, "
                  f"{args.valid_steps} batches per check")
+
+        if start_step > 0:
+            # Resuming: rebuild the optimizer so the cosine LR schedule spans
+            # exactly the remaining steps, not the original full train_steps —
+            # so it decays cleanly to ~0 by the end of THIS run instead of
+            # only getting partway through a schedule sized for the full total.
+            log.info(f"Resuming from step {start_step}: rebuilding LR "
+                     f"schedule over the remaining {remaining} steps "
+                     f"(peak lr={lr}).")
+            optimizer = optax.chain(
+                optax.clip_by_global_norm(3.0),
+                optax.adamw(cosine_annealing_lr(remaining, lr), weight_decay=1e-2),
+            )
         
         state = train(
             rng_train, nn_model, optimizer, deep_rv_train_step,

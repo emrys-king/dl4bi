@@ -90,10 +90,11 @@ MASK_FRACTION = 0.5
 BATCH_SIZE    = 32
 JITTER        = 5e-4
 
-# SM configurations for the [0,100]² grid.
+# Base (single-component) SM configurations for the [0,100]² grid.
 # means    : /100 relative to [0,1] values
 # variances: /1000 relative to [0,1] values
-SM_CONFIGS = {
+# build_sm_config() below extends each of these to Q components.
+SM_CONFIG_BASE = {
     "slow": {
         "weights":   [1.0],
         "means":     [[0.003, 0.002]],
@@ -114,6 +115,48 @@ SM_CONFIGS = {
     },
 }
 
+
+def build_sm_config(config_name, Q, harmonic_decay=0.6):
+    """Build a Q-component SM kernel config from a 1-component base definition.
+
+    For Q=1 this reduces exactly to SM_CONFIG_BASE[config_name] — fully
+    backward compatible with every existing single-component run.
+
+    For Q>1, additional components are added as harmonics of the base
+    frequency:
+        mean_q = mean_1 * (q+1)         (q = 0, 1, ..., Q-1)
+        var_q  = var_1  * (q+1)
+    with weights decaying geometrically, w_q ∝ harmonic_decay**q
+    (normalised to sum to 1), so the fundamental (lowest-frequency)
+    component dominates and higher harmonics contribute progressively
+    less — qualitatively matching the original hand-tuned 3-component
+    configs (e.g. weights ≈ [0.5, 0.3, 0.2] for Q=3 at the default decay).
+
+    Args:
+        config_name:    one of SM_CONFIG_BASE's keys ("slow"/"medium"/"fast")
+        Q:              number of mixture components to generate
+        harmonic_decay: geometric decay rate for weights (default: 0.6)
+    """
+    base       = SM_CONFIG_BASE[config_name]
+    base_means = base["means"][0]
+    base_vars  = base["variances"][0]
+
+    weights_raw = np.array([harmonic_decay ** q for q in range(Q)])
+    weights     = (weights_raw / weights_raw.sum()).tolist()
+    means       = [[m * (q + 1) for m in base_means] for q in range(Q)]
+    variances   = [[v * (q + 1) for v in base_vars]  for q in range(Q)]
+
+    label = base["label"]
+    if Q > 1:
+        label = f"{label}, Q={Q}"
+
+    return {
+        "weights":   weights,
+        "means":     means,
+        "variances": variances,
+        "label":     label,
+    }
+
 # =============================================================================
 # Argument parsing
 # =============================================================================
@@ -128,6 +171,8 @@ def parse_args():
                    choices=["slow", "medium", "fast"])
     p.add_argument("--embed_dim",   type=int,   default=64,
                    help="Embedding dim (paper default: 64)")
+    p.add_argument("--q",           type=int,   default=1,
+                   help="Number of SM mixture components (default: 1)")
     # Training
     p.add_argument("--train_steps", type=int,   default=None)
     p.add_argument("--lr",          type=float, default=None)
@@ -1152,13 +1197,13 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
 
     # --- Optimise weights via expected marginal likelihood (skip for Q=1) ---
     rng, rng_wopt = random.split(rng)
-    if 1 == 1:
+    if args.q == 1:
         fixed_weights = jnp.array([1.0])
         log.info("Q=1: weight fixed to 1.0, skipping optimisation.")
     else:
         log.info("Optimising SM mixture weights via expected marginal likelihood…")
         fixed_weights = optimise_weights(
-            y_obs_norm, s_all, obs_idx, 1,
+            y_obs_norm, s_all, obs_idx, args.q,
             args.noise_std, y_std,
             n_steps=500, n_mc=8, lr=1e-2, rng=rng_wopt,
         )
@@ -1170,7 +1215,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
     drv_mean, drv_std, drv_samples, drv_extra, drv_time = deeprv_nuts_inference(
         decoder, y_obs_norm, y_mean, y_std,
         s_all, obs_idx, tst_idx,
-        1, args.noise_std,
+        args.q, args.noise_std,
         args.num_warmup, args.num_samples, num_chains, rng_drv,
         partial_dense_mass=args.partial_dense_mass,
         no_dense_mass=args.no_dense_mass,
@@ -1194,7 +1239,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
              f"Coverage={drv_metrics['Coverage_95']:.3f}  "
              f"Time={drv_time:.1f}s")
 
-    drv_hparam = evaluate_hyperparam_recovery(drv_samples, sm_config, 1, s_all.shape[1])
+    drv_hparam = evaluate_hyperparam_recovery(drv_samples, sm_config, args.q, s_all.shape[1])
     drv_hparam.to_csv(cfg_dir / "drv_hyperparam_recovery.csv", index=False)
     log.info("SM-DeepRV hyperparameter recovery:\n" +
              drv_hparam.to_string(index=False))
@@ -1207,7 +1252,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         egp_mean, egp_std, egp_samples, egp_extra, egp_time = exact_gp_nuts_inference(
             y_obs_norm, y_mean, y_std,
             s_all, obs_idx, tst_idx,
-            1, args.noise_std,
+            args.q, args.noise_std,
             args.num_warmup, args.num_samples, num_chains, rng_egp,
             partial_dense_mass=args.partial_dense_mass,
         no_dense_mass=args.no_dense_mass,
@@ -1231,7 +1276,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                  f"Coverage={egp_metrics['Coverage_95']:.3f}  "
                  f"Time={egp_time:.1f}s")
 
-        egp_hparam = evaluate_hyperparam_recovery(egp_samples, sm_config, 1, s_all.shape[1])
+        egp_hparam = evaluate_hyperparam_recovery(egp_samples, sm_config, args.q, s_all.shape[1])
         egp_hparam.to_csv(cfg_dir / "egp_hyperparam_recovery.csv", index=False)
         log.info("Exact GP hyperparameter recovery:\n" +
                  egp_hparam.to_string(index=False))
@@ -1243,7 +1288,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         log.info(f"Running ADVI ({args.advi_steps} steps, lr={args.advi_lr}) …")
         advi_mean, advi_std, advi_samples, advi_time, advi_losses = advi_inference(
             decoder, y_obs_norm, y_mean, y_std,
-            s_all, obs_idx, tst_idx, 1, args.noise_std,
+            s_all, obs_idx, tst_idx, args.q, args.noise_std,
             args.advi_steps, args.advi_lr, args.advi_samples, rng_advi,
         )
         for name, arr in [("advi_mean",   advi_mean),
@@ -1266,10 +1311,10 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
                             cfg_dir, config_name)
     plot_posterior_hyperparams(drv_samples,
                                egp_samples if egp_samples else None,
-                               1, sm_config, cfg_dir, config_name)
+                               args.q, sm_config, cfg_dir, config_name)
     plot_hyperparam_kde(drv_samples,
                         egp_samples if egp_samples else None,
-                        sm_config, 1, s_all.shape[1], cfg_dir, config_name)
+                        sm_config, args.q, s_all.shape[1], cfg_dir, config_name)
     plot_scatter_pred_vs_true(drv_mean, egp_mean, advi_mean, f_test,
                               sm_config["label"], cfg_dir, config_name)
 
@@ -1297,8 +1342,10 @@ def main():
     train_steps = paper_train_steps(args.grid_size, args.train_steps)
     lr          = paper_lr(args.grid_size, args.lr)
     num_chains  = paper_num_chains()
-    configs     = ({args.sm_config: SM_CONFIGS[args.sm_config]}
-                   if args.sm_config else SM_CONFIGS)
+    configs     = ({args.sm_config: build_sm_config(args.sm_config, args.q)}
+                   if args.sm_config else
+                   {name: build_sm_config(name, args.q)
+                    for name in SM_CONFIG_BASE})
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name  = f"inferbasic_{timestamp}_grid{args.grid_size}"
@@ -1306,7 +1353,7 @@ def main():
 
     ckpt_dir  = (args.load_ckpt or args.ckpt_dir or str(
         Path(args.results_dir) /
-        f"sim_checkpoints_grid{args.grid_size}_q{1}"
+        f"sim_checkpoints_grid{args.grid_size}_q{args.q}"
         f"_blks{2}_emb{args.embed_dim}"
     ))
 
@@ -1317,7 +1364,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=== SM-DeepRV Simulation ===")
-    log.info(f"Grid: {args.grid_size}²  Q={1}  "
+    log.info(f"Grid: {args.grid_size}²  Q={args.q}  "
              f"Steps={train_steps}  LR={lr}")
     log.info(f"NUTS: {args.num_warmup} warmup / {args.num_samples} samples / "
              f"{num_chains} chain(s)")
@@ -1334,7 +1381,7 @@ def main():
         [{"start": 0.0, "stop": 100.0, "num": args.grid_size}] * 2
     ).reshape(-1, 2)
 
-    loader = sm_dataloader(s_all, 1, BATCH_SIZE)
+    loader = sm_dataloader(s_all, args.q, BATCH_SIZE)
 
     # --- Train ---
     log.info("\n=== Training SM-DeepRV ===")
@@ -1342,7 +1389,7 @@ def main():
     wandb.init(project="sm_deeprv", entity="emrys-king25-imperial-college-london",
                name=run_name, config={
         "grid_size": args.grid_size, "train_steps": train_steps,
-        "lr": lr, "Q": 1, "num_blks": 2,
+        "lr": lr, "Q": args.q, "num_blks": 2,
         "embed_dim": args.embed_dim, "kernel": "spectral_mixture",
         "likelihood": "gaussian", "noise_std": args.noise_std,
     })
