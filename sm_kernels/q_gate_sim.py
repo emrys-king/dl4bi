@@ -145,6 +145,12 @@ def parse_args():
                    choices=list(SM_CONFIGS.keys()))
     p.add_argument("--embed_dim",   type=int,   default=64)
     p.add_argument("--num_blks",    type=int,   default=2)
+    p.add_argument("--model",       type=str,   default="gmlp",
+                   choices=["gmlp", "qgated"],
+                   help="Decoder architecture: gmlp (default, single gMLPDeepRV) or "
+                        "qgated (Q separate gMLPDeepRV branches, one per SM component). "
+                        "qgated gives each component its own spatial gating, conditioned "
+                        "only on that component's parameters.")
     # Training
     p.add_argument("--train_steps", type=int,   default=None)
     p.add_argument("--lr",          type=float, default=None)
@@ -181,7 +187,7 @@ def parse_args():
     # Masking
     p.add_argument("--mask_type",     type=str,   default="contiguous",
                    choices=["contiguous", "random", "blob"])
-    p.add_argument("--mask_fraction", type=float, default=0.3)
+    p.add_argument("--mask_fraction", type=float, default=0.5)
     # Misc
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--results_dir",  type=str,   default="results")
@@ -268,24 +274,32 @@ def spectral_mixture(x, y, weights, means, variances):
 # Training dataloader
 # =============================================================================
 
-def sm_dataloader(s, Q, batch_size=BATCH_SIZE, alpha_dirichlet=0.0):
+def sm_dataloader(s, Q, batch_size=BATCH_SIZE, alpha_dirichlet=0.0,
+                  mu_ig_params=None):
     """JIT-compiled SM kernel dataloader.
 
     Hyperparameter sampling — must match _sm_hyperparameter_priors exactly:
       weights   : Dirichlet(alpha) — uniform if alpha=0 (treated as 1.0)
-      means     : Q=1: Uniform(0.0005, 0.30) per dimension independently
-                  Q>1: ordered by x-direction (label-switching fix) +
-                       independent y-direction
-      variances : derived from ell ~ Uniform(1, 35) (same prior as inference)
+      means     : sampled via Betancourt InverseGamma on period T=1/µ if
+                  mu_ig_params=(a,b) is provided; else Uniform(0.0005, mu_max)
+                  Q>1: ordered by x-direction (label-switching fix)
+      variances : derived from component-specific ell bounds (np.linspace)
 
     Conditionals: [weights, log(means).ravel(), log(vars_).ravel()]
     """
-    N, D   = s.shape
-    jitter = JITTER * jnp.eye(N)
-    alpha  = alpha_dirichlet if alpha_dirichlet > 0.0 else 1.0
+    N, D      = s.shape
+    jitter    = JITTER * jnp.eye(N)
+    alpha     = alpha_dirichlet if alpha_dirichlet > 0.0 else 1.0
+    # Nyquist clamping — used as fallback if no Betancourt params provided
+    spacing   = 100.0 / (int(round(N ** 0.5)) - 1)
+    mu_max    = float(0.95 / (2.0 * spacing))
 
-    spacing = 100.0 / (int(round(N ** 0.5)) - 1)
-    mu_max  = float(0.95 / (2.0 * spacing))   # 0.95 * mu_nyquist
+    # Betancourt period prior parameters (concrete Python floats, safe in @jit)
+    if mu_ig_params is not None:
+        a_mu, b_mu = float(mu_ig_params[0]), float(mu_ig_params[1])
+        use_betancourt = True
+    else:
+        use_betancourt = False
 
     @jit
     def generate_batch(rng_w, rng_mu, rng_v, rng_z):
@@ -296,26 +310,46 @@ def sm_dataloader(s, Q, batch_size=BATCH_SIZE, alpha_dirichlet=0.0):
             raw     = random.gamma(rng_w, a=alpha, shape=(Q,))
             weights = raw / raw.sum()
 
-        # --- Means (with ordering constraint for Q > 1) ---
-        if Q == 1:
-            means = random.uniform(rng_mu, shape=(1, D),
-                                   minval=0.0005, maxval=mu_max)
+        # --- Means via Betancourt period prior or Nyquist-clamped Uniform ---
+        if use_betancourt:
+            # T = 1/µ ~ InverseGamma(a_mu, b_mu)  =>  µ = 1/T
+            # InverseGamma(a,b) sampled as b / Gamma(a)
+            if Q == 1:
+                T    = b_mu / random.gamma(rng_mu, a=a_mu, shape=(1, D))
+                means = 1.0 / T                                    # (1, D)
+            else:
+                rng_base, rng_delta, rng_y = random.split(rng_mu, 3)
+                # Sample Q periods in descending order (ascending frequency)
+                T_base   = b_mu / random.gamma(rng_base, a=a_mu, shape=())
+                # Positive increments in 1/T space to maintain ascending µ
+                delta_T  = b_mu / random.gamma(
+                    rng_delta, a=a_mu, shape=(Q - 1,)) * 0.5
+                T_x = jnp.concatenate(
+                    [T_base[None], T_base - jnp.cumsum(delta_T)]
+                )                                                   # (Q,) descending T
+                T_x = jnp.clip(T_x, 1.0 / mu_max, 1e6)            # clamp to valid range
+                means_x = 1.0 / T_x                               # (Q,) ascending µ
+                T_y  = b_mu / random.gamma(rng_y, a=a_mu, shape=(Q,))
+                means_y = jnp.clip(1.0 / T_y, 0.0005, mu_max)
+                means   = jnp.stack([means_x, means_y], axis=-1)  # (Q, D)
         else:
-            # Order by x-direction frequency to break label-switching.
-            # First component's x-frequency in [0.0005, 0.30/Q];
-            # each subsequent component is strictly larger.
-            rng_base, rng_delta, rng_y = random.split(rng_mu, 3)
-            mu_x_base  = random.uniform(rng_base, shape=(),
-                                        minval=0.0005, maxval=mu_max / Q)
-            delta_mu_x = random.uniform(rng_delta, shape=(Q - 1,),
-                                        minval=0.0,
-                                        maxval=(mu_max - 0.0005) / Q)
-            means_x = jnp.concatenate(
-                [mu_x_base[None], mu_x_base + jnp.cumsum(delta_mu_x)]
-            )                                                   # (Q,)
-            means_y = random.uniform(rng_y, shape=(Q,),
-                                     minval=0.0005, maxval=mu_max)
-            means = jnp.stack([means_x, means_y], axis=-1)    # (Q, D)
+            # Fallback: Nyquist-clamped Uniform (original approach)
+            if Q == 1:
+                means = random.uniform(rng_mu, shape=(1, D),
+                                       minval=0.0005, maxval=mu_max)
+            else:
+                rng_base, rng_delta, rng_y = random.split(rng_mu, 3)
+                mu_x_base  = random.uniform(rng_base, shape=(),
+                                            minval=0.0005, maxval=mu_max / Q)
+                delta_mu_x = random.uniform(rng_delta, shape=(Q - 1,),
+                                            minval=0.0,
+                                            maxval=(mu_max - 0.0005) / Q)
+                means_x = jnp.concatenate(
+                    [mu_x_base[None], mu_x_base + jnp.cumsum(delta_mu_x)]
+                )
+                means_y = random.uniform(rng_y, shape=(Q,),
+                                         minval=0.0005, maxval=mu_max)
+                means   = jnp.stack([means_x, means_y], axis=-1)
 
         # --- Variances via component-specific lengthscale ---
         # Bounds decrease linearly from 50 (lowest-µ component) to 10
@@ -349,6 +383,68 @@ def sm_dataloader(s, Q, batch_size=BATCH_SIZE, alpha_dirichlet=0.0):
             yield {"s": s, "z": z, "conditionals": conditionals, "f": f}
 
     return dataloader
+
+
+def calibrate_period_prior(grid_size, domain=100.0, lower_q=0.05, upper_q=0.05):
+    """Betancourt-calibrated InverseGamma prior on the spectral period T = 1/µ.
+
+    Analogous to calibrated_ig_params() for lengthscales, but applied to the
+    oscillation period.  The period should lie between:
+      T_min = 2Δ  (Nyquist period — shortest representable oscillation)
+      T_max = domain  (full domain — no more than one cycle visible)
+
+    Finds InverseGamma(a, b) such that:
+      P(T < T_min) = lower_q   (soft Nyquist upper bound on µ)
+      P(T > T_max) = upper_q   (soft lower bound on µ)
+
+    This is a principled alternative to hard Nyquist clamping: rather than
+    truncating the prior at µ_nyq, it places diminishing but nonzero probability
+    on above-Nyquist frequencies, with the calibration ensuring that most mass
+    lies in the representable regime.  Frequencies are then µ = 1/T.
+
+    Returns: (a, b) — InverseGamma parameters for the period distribution
+    """
+    spacing = domain / (grid_size - 1)
+    T_min   = 2.0 * spacing          # Nyquist period
+    T_max   = domain                  # full domain period
+
+    def equations(log_ab):
+        a = np.exp(log_ab[0])
+        b = np.exp(log_ab[1])
+        return [
+            invgamma.cdf(T_min, a=a, scale=b) - lower_q,
+            invgamma.cdf(T_max, a=a, scale=b) - (1.0 - upper_q),
+        ]
+
+    best_result, best_resid = None, np.inf
+    for log_a0 in np.log([1.5, 3.0, 7.0]):
+        for log_b0 in np.log([T_min, np.sqrt(T_min * T_max), T_max / 2]):
+            try:
+                res   = root(equations, [log_a0, log_b0], method="hybr")
+                resid = np.max(np.abs(res.fun))
+                if res.success and resid < best_resid:
+                    best_resid  = resid
+                    best_result = res
+            except Exception:
+                continue
+
+    if best_result is not None and best_resid < 1e-6:
+        a = float(np.exp(best_result.x[0]))
+        b = float(np.exp(best_result.x[1]))
+        mu_nyq   = 1.0 / T_min
+        mu_lower = 1.0 / T_max
+        log.info(f"Betancourt period prior: IG({a:.3f}, {b:.3f})  "
+                 f"[T_min={T_min:.3f}, T_max={T_max:.1f}]  "
+                 f"=> µ in [{mu_lower:.5f}, {mu_nyq:.4f}]  "
+                 f"residual={best_resid:.2e}")
+    else:
+        # Fallback: use a weakly informative prior centred in the valid range
+        a = 3.0
+        b = float(np.sqrt(T_min * T_max))
+        log.warning(f"Betancourt period prior solver failed "
+                    f"(best residual={best_resid:.2e}). "
+                    f"Falling back to IG({a:.3f}, {b:.3f}).")
+    return a, b
 
 
 # =============================================================================
@@ -523,7 +619,7 @@ def optimise_weights(y_obs_norm, s_all, obs_idx, Q, noise_std, y_std,
 # Shared NUTS model — hyperparameter priors
 # =============================================================================
 
-def _sm_hyperparameter_priors(Q, D, mu_max, alpha_dirichlet=0.0, fixed_weights=None):
+def _sm_hyperparameter_priors(Q, D, alpha_dirichlet=0.0, fixed_weights=None):
     """Sample SM hyperparameters for inference on the [0,100]² grid.
 
     Matches sm_dataloader exactly so the decoder is never called
@@ -551,26 +647,26 @@ def _sm_hyperparameter_priors(Q, D, mu_max, alpha_dirichlet=0.0, fixed_weights=N
     if Q == 1:
         means = numpyro.sample(
             "means",
-            dist.Uniform(0.0005 * jnp.ones((1, D)), mu_max * jnp.ones((1, D)))
+            dist.Uniform(0.0005 * jnp.ones((1, D)), 0.30 * jnp.ones((1, D)))
         )
     else:
         # Ascending x-direction ordering to collapse Q! label-switching modes.
         # Base x-frequency in lower part of range; positive increments thereafter.
         mu_x_base = numpyro.sample(
             "mu_x_base",
-            dist.Uniform(0.0005, mu_max / Q)
+            dist.Uniform(0.0005, 0.30 / Q)
         )
         delta_mu_x = numpyro.sample(
             "delta_mu_x",
             dist.Uniform(jnp.zeros(Q - 1),
-                         (mu_max - 0.0005) / Q * jnp.ones(Q - 1))
+                         (0.30 - 0.0005) / Q * jnp.ones(Q - 1))
         )
         means_x = jnp.concatenate(
             [mu_x_base[None], mu_x_base + jnp.cumsum(delta_mu_x)]
         )                                                        # (Q,)
         means_y = numpyro.sample(
             "means_y",
-            dist.Uniform(0.0005 * jnp.ones(Q), mu_max * jnp.ones(Q))
+            dist.Uniform(0.0005 * jnp.ones(Q), 0.30 * jnp.ones(Q))
         )
         means = jnp.stack([means_x, means_y], axis=-1)          # (Q, D)
         numpyro.deterministic("means", means)
@@ -604,7 +700,6 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
                           s_all, obs_idx, tst_idx,
                           Q, noise_std,
                           num_warmup, num_samples, num_chains, rng,
-                          mu_max,
                           partial_dense_mass=False,
                           no_dense_mass=False,
                           likelihood="gaussian", studentt_df=7.0,
@@ -614,7 +709,7 @@ def deeprv_nuts_inference(decoder, y_obs_norm, y_mean, y_std,
 
     def model():
         weights, means, vars_, cond = _sm_hyperparameter_priors(
-            Q, D, mu_max, alpha_dirichlet=alpha_dirichlet, fixed_weights=fixed_weights)
+            Q, D, alpha_dirichlet=alpha_dirichlet, fixed_weights=fixed_weights)
         z = numpyro.sample("z", dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f = decoder(z[None], cond, s=s_all).squeeze()
         _observe("y", f[obs_idx], sigma_fixed, y_obs_norm, likelihood, studentt_df)
@@ -651,7 +746,6 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
                              s_all, obs_idx, tst_idx,
                              Q, noise_std,
                              num_warmup, num_samples, num_chains, rng,
-                             mu_max,
                              partial_dense_mass=False,
                              no_dense_mass=False,
                              likelihood="gaussian", studentt_df=7.0,
@@ -661,7 +755,7 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
 
     def model():
         weights, means, vars_, _ = _sm_hyperparameter_priors(
-            Q, D, mu_max, alpha_dirichlet=alpha_dirichlet, fixed_weights=fixed_weights)
+            Q, D, alpha_dirichlet=alpha_dirichlet, fixed_weights=fixed_weights)
         K = spectral_mixture(s_all, s_all, weights, means, vars_) \
             + JITTER * jnp.eye(N_all)
         L = jnp.linalg.cholesky(K)
@@ -699,14 +793,13 @@ def exact_gp_nuts_inference(y_obs_norm, y_mean, y_std,
 
 def advi_inference(decoder, y_obs_norm, y_mean, y_std,
                    s_all, obs_idx, tst_idx, Q, noise_std,
-                   num_steps, lr, num_samples, rng,
-                   mu_max, alpha_dirichlet=0.0):
+                   num_steps, lr, num_samples, rng, alpha_dirichlet=0.0):
     N_all, D    = s_all.shape
     sigma_fixed = noise_std / y_std
 
     def model():
         weights, means, vars_, cond = _sm_hyperparameter_priors(
-            Q, D, mu_max, alpha_dirichlet=alpha_dirichlet)
+            Q, D, alpha_dirichlet=alpha_dirichlet)
         z = numpyro.sample("z", dist.Normal(jnp.zeros(N_all), jnp.ones(N_all)))
         f = decoder(z[None], cond, s=s_all).squeeze()
         numpyro.sample("y", dist.Normal(f[obs_idx], sigma_fixed), obs=y_obs_norm)
@@ -931,7 +1024,7 @@ def load_latest_checkpoint(ckpt_dir, model, optimizer, loader):
 # =============================================================================
 
 def run_single_config(args, s_all, decoder, config_name, sm_config,
-                      out_dir, num_chains, rng, mu_max):
+                      out_dir, num_chains, rng):
     Q = args.q
     log.info(f"\n--- SM config: {config_name} ({sm_config['label']})  Q={Q} ---")
     assert Q == len(sm_config["weights"]), (
@@ -977,7 +1070,6 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         s_all, obs_idx, tst_idx,
         Q, args.noise_std,
         args.num_warmup, args.num_samples, num_chains, rng_drv,
-        mu_max,
         partial_dense_mass=args.partial_dense_mass,
         no_dense_mass=args.no_dense_mass,
         likelihood=args.likelihood, studentt_df=args.studentt_df,
@@ -1008,7 +1100,6 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
             s_all, obs_idx, tst_idx,
             Q, args.noise_std,
             args.num_warmup, args.num_samples, num_chains, rng_egp,
-            mu_max,
             partial_dense_mass=args.partial_dense_mass,
             no_dense_mass=args.no_dense_mass,
             likelihood=args.likelihood, studentt_df=args.studentt_df,
@@ -1037,7 +1128,7 @@ def run_single_config(args, s_all, decoder, config_name, sm_config,
         advi_mean, advi_std, advi_samples, advi_time, advi_losses = advi_inference(
             decoder, y_obs_norm, y_mean, y_std,
             s_all, obs_idx, tst_idx, Q, args.noise_std,
-            args.advi_steps, args.advi_lr, args.advi_samples, rng_advi, mu_max,
+            args.advi_steps, args.advi_lr, args.advi_samples, rng_advi,
             alpha_dirichlet=args.alpha_dirichlet,
         )
         for name, arr in [("advi_mean", advi_mean), ("advi_std", advi_std),
@@ -1110,6 +1201,79 @@ def sm_train_step(rng, state, batch):
 
 
 # =============================================================================
+# Q-Gated DeepRV architecture
+# =============================================================================
+
+class QGatedDeepRV(nn.Module):
+    """Q-component SM-DeepRV with per-component spatial gating.
+
+    Instead of one gMLP conditioned on the full (Q*15-dim) conditional
+    vector, runs Q separate gMLPDeepRV branches each conditioned only on
+    their own component's parameters:
+        cond_q = [log(w_q), log(mu_qx), log(mu_qy), log(v_qx), log(v_qy)]  (5-dim for D=2)
+
+    Outputs are combined with mixture weights:
+        f_hat = sum_q  w_q * gMLP_q(z, cond_q)
+
+    Each branch learns the spatial correlation structure appropriate to its
+    own kernel — component 1 (smooth, long-range) learns broad spatial gates;
+    component 3 (fast oscillation) learns local gates.  The shared z vector
+    preserves correlations across components as in the true GP sample.
+    """
+    Q:         int
+    D:         int
+    num_blks:  int
+    embed_dim: int
+
+    def setup(self):
+        self.decoders = [
+            gMLPDeepRV(
+                num_blks = self.num_blks,
+                embed    = dl4bi.mlp.MLP([self.embed_dim, self.embed_dim], nn.gelu),
+                proj_out = dl4bi.mlp.MLP([self.embed_dim, self.embed_dim], nn.gelu),
+            )
+            for _ in range(self.Q)
+        ]
+
+    def __call__(self, z, conditionals, s, **kwargs):
+        Q, D = self.Q, self.D
+        # Parse: [weights(Q), log_means(Q*D), log_vars(Q*D)]
+        weights   = conditionals[:Q]                               # (Q,)
+        log_means = conditionals[Q:Q*(1 + D)].reshape(Q, D)       # (Q, D)
+        log_vars  = conditionals[Q*(1 + D):].reshape(Q, D)        # (Q, D)
+
+        f_hat = None
+        for q in range(Q):
+            # Per-component conditional — same dimensionality as a Q=1 decoder,
+            # so each branch is architecturally identical to the baseline gMLP.
+            cond_q = jnp.concatenate([
+                jnp.log(jnp.clip(weights[q:q+1], 1e-8, 1.0)),    # log w_q   (1,)
+                log_means[q],                                       # log mu_q  (D,)
+                log_vars[q],                                        # log v_q   (D,)
+            ])                                                      # (1+2D,) = (5,) for D=2
+
+            output_q = self.decoders[q](z, cond_q, s=s)
+            f_q      = weights[q] * output_q.f_hat
+            f_hat    = f_q if f_hat is None else f_hat + f_q
+
+        return VAEOutput(f_hat=f_hat)
+
+
+def generate_q_gated_surrogate_decoder(state, model):
+    """Surrogate decoder for QGatedDeepRV — returns f_hat array directly,
+    matching the interface expected by deeprv_nuts_inference."""
+    @jit
+    def decoder(z, conditionals, s):
+        output = state.apply_fn(
+            {"params": state.params, **state.kwargs},
+            z, conditionals, s=s,
+            rngs={"extra": random.key(0)},
+        )
+        return output.f_hat
+    return decoder
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1124,18 +1288,17 @@ def main():
     configs     = ({args.sm_config: SM_CONFIGS[args.sm_config]}
                    if args.sm_config
                    else SM_CONFIGS)
-    spacing = 100.0 / (args.grid_size - 1)
-    mu_max  = float(0.95 / (2.0 * spacing))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name  = f"sim_{timestamp}_grid{args.grid_size}_q{Q}"
     out_dir   = Path(args.results_dir) / run_name
 
-    # Checkpoint dir is unique per (grid_size, Q, lr_schedule, embed_dim, num_blks)
+    # Checkpoint dir is unique per (grid_size, Q, lr_schedule, embed_dim, num_blks, model)
     ckpt_dir  = (args.load_ckpt or args.ckpt_dir or str(
         Path(args.results_dir) /
         f"sim_checkpoints_grid{args.grid_size}_q{Q}"
-        f"_blks{args.num_blks}_emb{args.embed_dim}_sched{args.lr_schedule}"
+        f"_blks{args.num_blks}_emb{args.embed_dim}"
+        f"_sched{args.lr_schedule}_model{args.model}"
     ))
 
     if args.fresh_run and Path(ckpt_dir).exists():
@@ -1175,20 +1338,31 @@ def main():
                    "grid_size": args.grid_size, "train_steps": train_steps,
                    "lr": lr, "lr_schedule": args.lr_schedule,
                    "Q": Q, "num_blks": args.num_blks,
-                   "embed_dim": args.embed_dim, "kernel": "spectral_mixture",
+                   "embed_dim": args.embed_dim, "model": args.model,
+                   "kernel": "spectral_mixture",
                    "likelihood": args.likelihood, "noise_std": args.noise_std,
                    "alpha_dirichlet": args.alpha_dirichlet,
                })
     wandb.define_metric("Train Loss",      step_metric="_step")
     wandb.define_metric("Valid norm MSE",  step_metric="_step")
 
-    nn_model  = gMLPDeepRV(
-        num_blks = args.num_blks,
-        embed    = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
-        proj_out = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
-    )
-    log.info(f"Architecture: gMLPDeepRV(num_blks={args.num_blks}, "
-             f"embed_dim={args.embed_dim})")
+    if args.model == "qgated":
+        nn_model = QGatedDeepRV(
+            Q        = Q,
+            D        = 2,
+            num_blks = args.num_blks,
+            embed_dim= args.embed_dim,
+        )
+        log.info(f"Architecture: QGatedDeepRV(Q={Q}, num_blks={args.num_blks}, "
+                 f"embed_dim={args.embed_dim}) — {Q} separate gMLP branches")
+    else:
+        nn_model = gMLPDeepRV(
+            num_blks = args.num_blks,
+            embed    = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
+            proj_out = dl4bi.mlp.MLP([args.embed_dim, args.embed_dim], nn.gelu),
+        )
+        log.info(f"Architecture: gMLPDeepRV(num_blks={args.num_blks}, "
+                 f"embed_dim={args.embed_dim})")
     optimizer = optax.chain(
         optax.clip_by_global_norm(3.0),
         optax.adamw(build_lr_schedule(args.lr_schedule, train_steps, lr),
@@ -1218,13 +1392,15 @@ def main():
 
         # Rebuild optimizer over remaining steps on resume (smoother LR continuation)
         if start_step > 0:
-            log.info(f"Resuming from step {start_step}: rebuilding LR schedule "
-                     f"({args.lr_schedule}) over remaining {remaining} steps "
-                     f"(peak lr={lr}).")
+            log.info(f"Resuming from step {start_step}: offsetting LR schedule "
+                     f"by {start_step} steps.")
+            # Build schedule over the full budget, offset by start_step so
+            # the optimizer resumes at the correct position in the curve.
+            full_schedule  = build_lr_schedule(args.lr_schedule, train_steps, lr)
+            offset_schedule = lambda step: full_schedule(step + start_step)
             optimizer = optax.chain(
                 optax.clip_by_global_norm(3.0),
-                optax.adamw(build_lr_schedule(args.lr_schedule, remaining, lr),
-                            weight_decay=1e-2),
+                optax.adamw(offset_schedule, weight_decay=1e-2),
             )
 
         state = train(
@@ -1250,7 +1426,10 @@ def main():
         log.info(f"--train_only: skipping inference. Checkpoint at {ckpt_dir}")
         return
 
-    decoder = generate_surrogate_decoder(state, nn_model)
+    if args.model == "qgated":
+        decoder = generate_q_gated_surrogate_decoder(state, nn_model)
+    else:
+        decoder = generate_surrogate_decoder(state, nn_model)
 
     # --- Inference ---
     log.info("\n=== Inference ===")
@@ -1259,7 +1438,7 @@ def main():
         rng_exp, rng_cfg = random.split(rng_exp)
         row = run_single_config(
             args, s_all, decoder, config_name, sm_config,
-            out_dir, num_chains, rng_cfg, mu_max
+            out_dir, num_chains, rng_cfg,
         )
         all_rows.append(row)
 
